@@ -36,7 +36,7 @@ flowchart LR
 
 | 架构铁律 | 底层工程实现 (`src/`) |
 | :--- | :--- |
-| **1. 原生 `COM IDataObject` + `TYMED_ISTREAM` 真流式管道** | 纯 C++17 手写 `IDataObject`、`IEnumFORMATETC` 与 `HttpChunkedStream : IStream` 原生虚表（无任何 GUI `Clipboard.SetText` 假延迟封装，无全量 `MemoryStream` 缓冲）。`FILEDESCRIPTORW` 开启 `FD_FILESIZE \| FD_PROGRESSUI \| FD_WRITESTIME`，仅在 `GetData` 被请求时发单次轻量 `HTTP HEAD` 获取 `Content-Length`，随后在 `IStream::Read` 中以 `64 KB ~ 256 KB` 分块拉流直写目标目录，实测 24 MB 传输内存峰值增量仅 **`1.62 MB`**（严格 `< 8 MB`）。 |
+| **1. 原生 `COM IDataObject` + `TYMED_ISTREAM` 真流式管道** | 纯 C++17 手写 `IDataObject`、`IEnumFORMATETC` 与 `HttpChunkedStream : IStream` 原生虚表（无任何 GUI `Clipboard.SetText` 假延迟封装，无全量 `MemoryStream` 缓冲）。`FILEDESCRIPTORW` 开启 `FD_FILESIZE \| FD_PROGRESSUI \| FD_WRITESTIME`，仅在 `GetData` 被请求时发单次轻量 `HTTP HEAD` 获取 `Content-Length`，随后在 `IStream::Read` 中以 `64 KB ~ 256 KB` 分块拉流直写目标目录，实测 24 MB 传输内存峰值增量仅 **`1.55 MB`**（严格 `< 8 MB`）。 |
 | **2. 双层防御后台嗅探「提前误坍缩」** | **第一层**：挂载微软官方免监控格式 `CanIncludeInClipboardHistory = 0`、`CanUploadToCloudClipboard = 0`、`ExcludeClipboardContentFromMonitorProcessing = 1`，阻止 `Win+V` 云剪贴板后台扫盘；<br>**第二层**：在 `IDataObject::GetData` 入口通过 `I_RpcBindingInqLocalClientPID` 精确提取跨进程 COM 调用方 PID，拦截 `TextInputHost.exe`、`svchost.exe (ClipboardUserSvc)`、`SearchHost.exe` 等后台嗅探服务并记录拦截遥测。 |
 | **3. 防自激死循环 + 非破坏性无限次异构坍缩** | 组合私有信封格式 `SchrodingerClip.SuperpositionEnvelope` + `OleIsCurrentClipboard()` + `GetClipboardSequenceNumber()` 三重防自激锁。单次 `Ctrl+C` 后剪贴板序列号恒定不变，可连续在 VS Code (`.ts` / `.py`)、DataGrip (`.sql`)、Excel、微信、资源管理器连按 `Ctrl+V` 无限次坍缩出异构产物。 |
 | **4. 亚毫秒级双层观测者身份嗅探器** | `GetForegroundWindow()` + `I_RpcBindingInqLocalClientPID()` 智能协同（耗时 `< 0.10 ms`）：<br>• **宿主进程层**：精准区分编辑器、终端、电子表格、数据库客户端、富文本/邮件、IM/画板/演示与 `explorer.exe`；<br>• **窗口微语境层**：自动剥离编辑器脏标记（`●` / `*` / `•`）提取激活文件后缀（`.ts/.tsx`, `.py`, `.go`, `.rs`, `.sql`, `.md`, `.html/.css`, `.http`），并从浏览器标题识别 `Google Sheets / 飞书表格 / 腾讯文档 / Notion / GitHub / Excalidraw`。 |
@@ -130,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File .\verify_e2e.ps1
 | **验证 1：严格延迟求值与零预下载** | 挂载 24 MB (`25,165,824 Bytes`) 测试文件 HTTP 服务器，写入真实系统剪贴板并校验免监控护盾后等待 `650 ms` | 服务器收到 **`0 GET`、`0 HEAD`、`0 Bytes` 下载** |
 | **验证 2：单次复制、7 语境非破坏性坍缩** | 同一复杂嵌套 JSON 在不重新复制前提下（序列号恒定），连续经真实 COM 读取 `.ts`、`.py`、`.sql`、Excel (`CF_HTML`+`CSV`+`TSV`)、`.go`、`.rs`、Explorer `.xlsx` 流 | **7 次异构坍缩全部精准合法，剪贴板序列号 0 变化** |
 | **验证 3：视觉即时光栅化合成** | 注入 SVG 矢量源码、代码片段与 `#3B82F6` 色值，经 COM 请求 `PNG` / `CF_DIBV5` / `CF_DIB` | 精确合成 `2x` HiDPI 图像（300×200 SVG ──▶ **600×400 32bpp PNG/DIBV5**） |
-| **验证 4：`TYMED_ISTREAM` 24 MB 真流式落盘** | 经真实 COM `CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS (IStream::Read)` 分 192 块流式落盘 24 MB 文件 | 吞吐率 **`146.6 MB/s`**，守护进程峰值内存增量 **`1.62 MB` (`< 8 MB`)**，落盘文件与源数据 **`SHA-256` 100% 字节级一致** |
+| **验证 4：`TYMED_ISTREAM` 24 MB 真流式落盘** | 经真实 COM `CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS (IStream::Read)` 分 192 块流式落盘 24 MB 文件 | 吞吐率 **`284.9 MB/s`**，守护进程峰值内存增量 **`1.55 MB` (`< 8 MB`)**，落盘文件与源数据 **`SHA-256` 100% 字节级一致** |
 | **验证 5：旁路开关与优雅退出** | 验证 `Raw Bypass` 切换及 `/api/shutdown` 退出释放 OLE 剪贴板句柄 | 进程 `0` 死锁退出 (`code 0`)，OLE 剪贴板干净卸载 |
 
 ---

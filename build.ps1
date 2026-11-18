@@ -2,6 +2,15 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 if (-not (Get-Command g++ -ErrorAction SilentlyContinue)) {
+    $CandidatePaths = @("C:\msys64\ucrt64\bin", "C:\msys64\mingw64\bin", "C:\mingw64\bin")
+    foreach ($p in $CandidatePaths) {
+        if (Test-Path "$p\g++.exe") {
+            $env:PATH = "$p;$env:PATH"
+            break
+        }
+    }
+}
+if (-not (Get-Command g++ -ErrorAction SilentlyContinue)) {
     Write-Error "g++ (MinGW-w64 x86_64 C++17) not found in PATH."
     exit 1
 }

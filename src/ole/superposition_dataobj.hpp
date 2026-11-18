@@ -245,11 +245,15 @@ public:
             pmedium->hGlobal = AllocHGlobalDword(1); // Official MS flag: Exclude from clipboard monitors!
             return pmedium->hGlobal ? S_OK : E_OUTOFMEMORY;
         }
-        if (cf == rf.cfPreferredDropEffect) {
-            if (!(pformatetcIn->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
-            pmedium->tymed = TYMED_HGLOBAL;
-            pmedium->hGlobal = AllocHGlobalDword(DROPEFFECT_COPY);
-            return pmedium->hGlobal ? S_OK : E_OUTOFMEMORY;
+        {
+            std::lock_guard<std::mutex> lk(lazyCacheMu_);
+            auto ait = ancillaryBlobs_.find(cf);
+            if (ait != ancillaryBlobs_.end()) {
+                if (!(pformatetcIn->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
+                pmedium->tymed = TYMED_HGLOBAL;
+                pmedium->hGlobal = AllocHGlobalBytes(ait->second.data(), ait->second.size());
+                return pmedium->hGlobal ? S_OK : E_OUTOFMEMORY;
+            }
         }
 
         // --------------------------------------------------------------------
@@ -274,6 +278,18 @@ public:
             return DV_E_FORMATETC;
         }
 
+        // Unified Observer + Lock-Mode Format Gate
+        if (!IsFormatAllowedForObserver(cf, obs)) {
+            return DV_E_FORMATETC;
+        }
+
+        if (cf == rf.cfPreferredDropEffect) {
+            if (!(pformatetcIn->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
+            pmedium->tymed = TYMED_HGLOBAL;
+            pmedium->hGlobal = AllocHGlobalDword(DROPEFFECT_COPY);
+            return pmedium->hGlobal ? S_OK : E_OUTOFMEMORY;
+        }
+
         // Raw Bypass Mode: only serve raw text or original CF_HDROP
         if (obs.lockMode == ManualLockMode::RawBypass) {
             if (cf == CF_HDROP && seed_.kind == SuperpositionKind::LocalFiles) {
@@ -290,18 +306,7 @@ public:
         }
 
         // --------------------------------------------------------------------
-        // 3. Visual Priority Gate for Chat / Canvas / Slides Hosts
-        //    When WeChat / Slack / Paint / PPT pastes a visual card seed,
-        //    decline CF_UNICODETEXT so the host selects PNG / CF_DIBV5!
-        // --------------------------------------------------------------------
-        if ((cf == CF_UNICODETEXT || cf == CF_TEXT) &&
-            obs.category == HostCategory::VisualCanvasOrChat &&
-            SupportsVisualImageCollapse()) {
-            return DV_E_FORMATETC;
-        }
-
-        // --------------------------------------------------------------------
-        // 4. Route Format Synthesis On-The-Fly!
+        // 3. Route Format Synthesis On-The-Fly!
         // --------------------------------------------------------------------
         if (cf == CF_HDROP && seed_.kind == SuperpositionKind::LocalFiles) {
             if (!(pformatetcIn->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
@@ -358,11 +363,21 @@ public:
             if (pformatetc->lindex != -1) return DV_E_LINDEX;
         }
 
-        // Visual priority gate in QueryGetData for Chat/Canvas apps
-        if ((cf == CF_UNICODETEXT || cf == CF_TEXT) && observerMgr_) {
+        // Always serve shield/envelope/ancillary SetData formats (e.g. "Ole Private Data")
+        if (cf == rf.cfEnvelope || cf == rf.cfCanIncludeHistory ||
+            cf == rf.cfCanUploadCloud || cf == rf.cfExcludeMonitor) {
+            return (pformatetc->tymed & TYMED_HGLOBAL) ? S_OK : DV_E_TYMED;
+        }
+        {
+            std::lock_guard<std::mutex> lk(lazyCacheMu_);
+            if (ancillaryBlobs_.count(cf)) {
+                return (pformatetc->tymed & TYMED_HGLOBAL) ? S_OK : DV_E_TYMED;
+            }
+        }
+
+        if (observerMgr_) {
             ObserverSnapshot obs = observerMgr_->Capture(true);
-            if (!obs.isBlockedSniffer && obs.lockMode != ManualLockMode::RawBypass &&
-                obs.category == HostCategory::VisualCanvasOrChat && SupportsVisualImageCollapse()) {
+            if (!IsFormatAllowedForObserver(cf, obs)) {
                 return DV_E_FORMATETC;
             }
         }
@@ -383,8 +398,18 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetData(FORMATETC* pformatetc, STGMEDIUM* pmedium, BOOL fRelease) override {
-        // OLE clipboard stores ancillary formats (like Preferred DropEffect or Ole Private Data) cleanly if accepted
+        // Persist ancillary HGLOBAL blobs stored by OLE/Shell (e.g. "Ole Private Data",
+        // "Performed DropEffect", "Paste Succeeded") so CClipDataObject & Explorer preserve exact FORMATETC state!
         if (!pformatetc || !pmedium) return E_INVALIDARG;
+        if (pmedium->tymed == TYMED_HGLOBAL && pmedium->hGlobal != nullptr) {
+            size_t sz = GlobalSize(pmedium->hGlobal);
+            const uint8_t* ptr = static_cast<const uint8_t*>(GlobalLock(pmedium->hGlobal));
+            if (ptr && sz > 0) {
+                std::lock_guard<std::mutex> lk(lazyCacheMu_);
+                ancillaryBlobs_[pformatetc->cfFormat].assign(ptr, ptr + sz);
+                GlobalUnlock(pmedium->hGlobal);
+            }
+        }
         if (fRelease) {
             ReleaseStgMedium(pmedium);
         }
@@ -425,6 +450,7 @@ private:
     std::mutex lazyCacheMu_;
     bool hasProbedUrlHead_ = false;
     UrlHeadMetadata cachedUrlHead_;
+    std::map<UINT, std::vector<uint8_t>> ancillaryBlobs_;
 
     static FORMATETC MakeFmt(UINT cf, DWORD tymed = TYMED_HGLOBAL, LONG lindex = -1) {
         FORMATETC f = {};
@@ -436,6 +462,23 @@ private:
         return f;
     }
 
+    UrlHeadMetadata EnsureUrlHeadProbed() {
+        std::lock_guard<std::mutex> lk(lazyCacheMu_);
+        if (!hasProbedUrlHead_) {
+            cachedUrlHead_ = ProbeUrlHeadMetadata(seed_.rawText, seed_.isGitHubRepoUrl);
+            hasProbedUrlHead_ = true;
+        }
+        return cachedUrlHead_;
+    }
+
+    // Strictly paste-time check: static image suffix OR HTTP HEAD Content-Type: image/*
+    bool IsRemoteUrlImageAtPasteTime() {
+        if (seed_.kind != SuperpositionKind::RemoteUrl || seed_.isGitHubRepoUrl) return false;
+        if (seed_.looksLikeImageUrl) return true;
+        UrlHeadMetadata head = EnsureUrlHeadProbed();
+        return StartsWithIgnoreCase(head.contentType, "image/");
+    }
+
     bool SupportsVirtualFileStream() const {
         return seed_.kind == SuperpositionKind::RemoteUrl ||
                seed_.kind == SuperpositionKind::StructuredData ||
@@ -444,11 +487,95 @@ private:
                seed_.kind == SuperpositionKind::HexColor;
     }
 
-    bool SupportsVisualImageCollapse() const {
-        return seed_.kind == SuperpositionKind::VisualSource ||
-               seed_.kind == SuperpositionKind::HexColor ||
-               seed_.kind == SuperpositionKind::CurlCommand ||
-               (seed_.kind == SuperpositionKind::RemoteUrl && seed_.looksLikeImageUrl);
+    bool SupportsAutoVisualImageCollapse() {
+        if (seed_.kind == SuperpositionKind::VisualSource ||
+            seed_.kind == SuperpositionKind::HexColor ||
+            seed_.kind == SuperpositionKind::CurlCommand) {
+            return true;
+        }
+        if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl) {
+            return IsRemoteUrlImageAtPasteTime();
+        }
+        return false;
+    }
+
+    bool IsFormatAllowedForObserver(UINT cf, const ObserverSnapshot& obs) {
+        const auto& rf = RegisteredFormats::Instance();
+        if (obs.isBlockedSniffer) return false;
+
+        // 1. Raw Bypass Mode
+        if (obs.lockMode == ManualLockMode::RawBypass) {
+            if (cf == CF_HDROP && seed_.kind == SuperpositionKind::LocalFiles) return true;
+            return (cf == CF_UNICODETEXT || cf == CF_TEXT);
+        }
+
+        // 2. Manual Lock: 2x PNG Visual Card (works on any seed!)
+        if (obs.lockMode == ManualLockMode::LockPngCard) {
+            return (cf == rf.cfPng || cf == CF_DIBV5 || cf == CF_DIB);
+        }
+
+        // 3. Manual Lock: Excel Multi-Column Grid
+        if (obs.lockMode == ManualLockMode::LockExcel) {
+            if (seed_.kind == SuperpositionKind::StructuredData && (cf == rf.cfHtml || cf == rf.cfCsv)) {
+                return true;
+            }
+            return (cf == CF_UNICODETEXT || cf == CF_TEXT);
+        }
+
+        // 4. Manual Lock: Explicit Code / Markdown / SQL Eigenstate Locks
+        if (obs.lockMode != ManualLockMode::Auto) {
+            return (cf == CF_UNICODETEXT || cf == CF_TEXT);
+        }
+
+        // 5. Auto Observer Mode Routing
+        if (cf == CF_HDROP) {
+            if (seed_.kind != SuperpositionKind::LocalFiles) return false;
+            if (obs.category == HostCategory::Terminal) return false;
+            if ((obs.lang == MicroLangContext::HtmlCss || obs.lang == MicroLangContext::Markdown) &&
+                seed_.isLocalImageFile && obs.category != HostCategory::FileExplorer) {
+                return false;
+            }
+            return true;
+        }
+
+        if (cf == rf.cfFileDescriptorW || cf == rf.cfFileContents || cf == rf.cfPreferredDropEffect) {
+            if (!SupportsVirtualFileStream()) return false;
+            return (obs.category == HostCategory::FileExplorer || obs.category == HostCategory::PlainGeneric);
+        }
+
+        if (cf == rf.cfPng || cf == CF_DIBV5 || cf == CF_DIB) {
+            if (obs.category != HostCategory::VisualCanvasOrChat && obs.category != HostCategory::PlainGeneric) {
+                return false;
+            }
+            return SupportsAutoVisualImageCollapse();
+        }
+
+        if (cf == rf.cfHtml) {
+            if (seed_.kind == SuperpositionKind::StructuredData) {
+                return (obs.category == HostCategory::Spreadsheet ||
+                        obs.category == HostCategory::RichDocument ||
+                        obs.category == HostCategory::PlainGeneric);
+            }
+            if (seed_.kind == SuperpositionKind::VisualSource) {
+                return (obs.category == HostCategory::RichDocument ||
+                        obs.category == HostCategory::PlainGeneric);
+            }
+            return false;
+        }
+
+        if (cf == rf.cfCsv) {
+            if (seed_.kind != SuperpositionKind::StructuredData) return false;
+            return (obs.category == HostCategory::Spreadsheet || obs.category == HostCategory::PlainGeneric);
+        }
+
+        if (cf == CF_UNICODETEXT || cf == CF_TEXT) {
+            if (obs.category == HostCategory::VisualCanvasOrChat && SupportsAutoVisualImageCollapse()) {
+                return false;
+            }
+            return true;
+        }
+
+        return false;
     }
 
     void BuildAdvertisedFormatList() {
@@ -466,7 +593,7 @@ private:
             formats_.push_back(MakeFmt(CF_HDROP, TYMED_HGLOBAL));
         }
 
-        // 3. Spreadsheet & Rich Document Formats (put HTML/CSV ahead of plain text for Excel/Word!)
+        // 3. Spreadsheet & Rich Document Formats
         if (seed_.kind == SuperpositionKind::StructuredData) {
             formats_.push_back(MakeFmt(rf.cfHtml, TYMED_HGLOBAL));
             formats_.push_back(MakeFmt(rf.cfCsv, TYMED_HGLOBAL));
@@ -474,12 +601,10 @@ private:
             formats_.push_back(MakeFmt(rf.cfHtml, TYMED_HGLOBAL));
         }
 
-        // 4. Visual Image Formats (PNG + CF_DIBV5 + CF_DIB)
-        if (SupportsVisualImageCollapse()) {
-            formats_.push_back(MakeFmt(rf.cfPng, TYMED_HGLOBAL));
-            formats_.push_back(MakeFmt(CF_DIBV5, TYMED_HGLOBAL));
-            formats_.push_back(MakeFmt(CF_DIB, TYMED_HGLOBAL));
-        }
+        // 4. Visual Image Formats (PNG + CF_DIBV5 + CF_DIB; gated lazily by observer & lockMode!)
+        formats_.push_back(MakeFmt(rf.cfPng, TYMED_HGLOBAL));
+        formats_.push_back(MakeFmt(CF_DIBV5, TYMED_HGLOBAL));
+        formats_.push_back(MakeFmt(CF_DIB, TYMED_HGLOBAL));
 
         // 5. Universal Polymorphic Text Formats
         formats_.push_back(MakeFmt(CF_UNICODETEXT, TYMED_HGLOBAL));
@@ -489,6 +614,7 @@ private:
         if (SupportsVirtualFileStream()) {
             formats_.push_back(MakeFmt(rf.cfFileDescriptorW, TYMED_HGLOBAL, -1));
             formats_.push_back(MakeFmt(rf.cfFileContents, TYMED_ISTREAM, 0));
+            formats_.push_back(MakeFmt(rf.cfFileContents, TYMED_ISTREAM, -1));
             formats_.push_back(MakeFmt(rf.cfPreferredDropEffect, TYMED_HGLOBAL, -1));
         }
     }
@@ -555,7 +681,7 @@ private:
         switch (seed_.kind) {
             case SuperpositionKind::RemoteUrl: {
                 if (obs.category == HostCategory::Terminal) {
-                    std::string cmd = CollapseUrlToTerminalCommand(seed_.rawText, seed_.isGitHubRepoUrl);
+                    std::string cmd = CollapseUrlToTerminalCommand(seed_.rawText, seed_.isGitHubRepoUrl, obs.processName);
                     return DeliverUtf8Text(cf, pfmt, pmedium, cmd, obs, "shell_cmd",
                                            seed_.isGitHubRepoUrl ? "URL -> git clone" : "URL -> Resumable curl -fLO", tStart);
                 }
@@ -723,7 +849,7 @@ private:
     // ------------------------------------------------------------------------
     // Visual Bitmap Synthesis Router (PNG + CF_DIBV5 + CF_DIB)
     // ------------------------------------------------------------------------
-    RenderedImageBundle SynthesizeVisualBundle(std::string& outDesc) {
+    RenderedImageBundle SynthesizeVisualBundle(std::string& outDesc, ManualLockMode lockMode = ManualLockMode::Auto) {
         if (seed_.kind == SuperpositionKind::HexColor) {
             outDesc = "#HEX -> 2x Designer Swatch PNG";
             return RenderColorSwatchBitmap2x(seed_.rawText);
@@ -738,8 +864,8 @@ private:
                 return RenderMermaidBitmap2x(seed_.rawText);
             }
             if (seed_.visualSyntax == VisualSyntax::MathLatex) {
-                outDesc = "Math LaTeX -> 2x Formula Card PNG";
-                return RenderCodeCardBitmap2x(seed_.rawText, "QUANTUM MATH // 2X HIDPI");
+                outDesc = "Math LaTeX -> 2x Typeset Formula Card PNG";
+                return RenderMathFormulaBitmap2x(seed_.rawText);
             }
             outDesc = "Source Code -> 2x Syntax Card PNG";
             return RenderCodeCardBitmap2x(seed_.rawText, "SCHRODINGER CODE CARD // 2X HIDPI");
@@ -748,12 +874,16 @@ private:
             outDesc = "cURL -> 2x API Request Card PNG";
             return RenderCodeCardBitmap2x(seed_.rawText, "NETWORK CURL // 2X HIDPI");
         }
-        if (seed_.kind == SuperpositionKind::RemoteUrl && seed_.looksLikeImageUrl) {
+        if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl && IsRemoteUrlImageAtPasteTime()) {
             outDesc = "Remote Image URL -> Lazy Decoded Bitmap";
             std::vector<uint8_t> rawImg;
             if (FetchRemoteImageBytesOnDemand(seed_.rawText, rawImg)) {
                 return DecodeRawImageBytesToBundle(rawImg);
             }
+        }
+        if (lockMode == ManualLockMode::LockPngCard && !seed_.rawText.empty()) {
+            outDesc = "Locked Visual Eigenstate -> 2x Syntax Card PNG";
+            return RenderCodeCardBitmap2x(seed_.rawText, "LOCKED 2X VISUAL CARD // HIDPI");
         }
         return RenderedImageBundle{};
     }
@@ -765,7 +895,7 @@ private:
                                   std::chrono::steady_clock::time_point tStart) {
         if (!(pfmt->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
         std::string desc;
-        RenderedImageBundle bundle = SynthesizeVisualBundle(desc);
+        RenderedImageBundle bundle = SynthesizeVisualBundle(desc, obs.lockMode);
         if (!bundle.valid) return DV_E_FORMATETC;
 
         const auto& rf = RegisteredFormats::Instance();
@@ -801,15 +931,7 @@ private:
 
     bool PrepareVirtualFileSpec(VirtualFileSpec& spec, bool needPayloadBytes) {
         if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl) {
-            UrlHeadMetadata head;
-            {
-                std::lock_guard<std::mutex> lk(lazyCacheMu_);
-                if (!hasProbedUrlHead_) {
-                    cachedUrlHead_ = ProbeUrlHeadMetadata(seed_.rawText, false);
-                    hasProbedUrlHead_ = true;
-                }
-                head = cachedUrlHead_;
-            }
+            UrlHeadMetadata head = EnsureUrlHeadProbed();
             spec.isRemoteStream = true;
             spec.fileName = head.suggestedFilename.empty()
                                 ? SanitizeWindowsFilename(Utf8ToWide(GuessUrlFilenameUtf8(seed_.rawText, false)))
@@ -855,9 +977,13 @@ private:
             std::string desc;
             RenderedImageBundle bundle = SynthesizeVisualBundle(desc);
             if (!bundle.valid) return false;
-            spec.fileName = (seed_.visualSyntax == VisualSyntax::Mermaid)
-                                ? L"mermaid_diagram_2x.png"
-                                : L"quantum_code_card_2x.png";
+            if (seed_.visualSyntax == VisualSyntax::Mermaid) {
+                spec.fileName = L"mermaid_diagram_2x.png";
+            } else if (seed_.visualSyntax == VisualSyntax::MathLatex) {
+                spec.fileName = L"quantum_formula_2x.png";
+            } else {
+                spec.fileName = L"quantum_code_card_2x.png";
+            }
             spec.generatedBytes = std::move(bundle.pngBytes);
             spec.hasKnownSize = true;
             spec.fileSize = spec.generatedBytes.size();

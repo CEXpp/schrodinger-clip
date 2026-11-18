@@ -81,7 +81,9 @@ inline std::string CollapseUrlToMarkdown(const std::string& rawUrl, bool isGitHu
     return "[" + label + "](" + u + ")";
 }
 
-inline std::string CollapseUrlToTerminalCommand(const std::string& rawUrl, bool isGitHubRepo) {
+inline std::string CollapseUrlToTerminalCommand(const std::string& rawUrl,
+                                                bool isGitHubRepo,
+                                                const std::string& observerProcess = "") {
     std::string u = Trim(rawUrl);
     if (isGitHubRepo) {
         std::string cloneUrl = u;
@@ -89,7 +91,10 @@ inline std::string CollapseUrlToTerminalCommand(const std::string& rawUrl, bool 
         if (!EndsWithIgnoreCase(cloneUrl, ".git")) cloneUrl += ".git";
         return "git clone " + cloneUrl;
     }
-    return "curl -fLO -C - \"" + ReplaceAll(u, "\"", "\\\"") + "\"";
+    // In Windows PowerShell 5.1 (powershell.exe), 'curl' is aliased to Invoke-WebRequest;
+    // invoking 'curl.exe' explicitly guarantees native libcurl execution!
+    std::string bin = (ToLowerAscii(observerProcess) == "powershell.exe") ? "curl.exe" : "curl";
+    return bin + " -fLO -C - \"" + ReplaceAll(u, "\"", "\\\"") + "\"";
 }
 
 struct UrlHeadMetadata {

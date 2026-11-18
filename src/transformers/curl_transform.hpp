@@ -20,10 +20,17 @@ struct ParsedCurl {
 
 inline std::vector<std::string> TokenizeCurlCommand(const std::string& raw) {
     // Normalize line continuations: backslash+\r?\n, caret ^+\r?\n (Windows CMD), backtick `+\r?\n (PowerShell)
+    // Also handle Chrome/Edge Windows "Copy as cURL (cmd)" caret escaping (^"^{^\^"k^\^":^\^"v^\^"^}^") outside '...'
     std::string norm;
     norm.reserve(raw.size());
+    bool inSingleQuote = false;
     for (size_t i = 0; i < raw.size(); ++i) {
-        if ((raw[i] == '\\' || raw[i] == '^' || raw[i] == '`') && i + 1 < raw.size()) {
+        if (raw[i] == '\'' && (i == 0 || raw[i - 1] != '\\')) {
+            inSingleQuote = !inSingleQuote;
+            norm.push_back(raw[i]);
+            continue;
+        }
+        if (!inSingleQuote && (raw[i] == '\\' || raw[i] == '^' || raw[i] == '`') && i + 1 < raw.size()) {
             if (raw[i + 1] == '\n') {
                 norm.push_back(' ');
                 ++i;
@@ -34,9 +41,8 @@ inline std::vector<std::string> TokenizeCurlCommand(const std::string& raw) {
                 i += 2;
                 continue;
             }
-            // CMD caret escaping ^" or ^{ -> unescape next punctuation if CMD style
-            if (raw[i] == '^' && (raw[i + 1] == '"' || raw[i + 1] == '{' || raw[i + 1] == '}' ||
-                                  raw[i + 1] == '&' || raw[i + 1] == '|' || raw[i + 1] == '^')) {
+            // CMD caret escaping (^" ^\ ^{ ^} ^& ^| ^^ ^% ^! etc.) outside single quotes
+            if (raw[i] == '^' && static_cast<unsigned char>(raw[i + 1]) > 0x20) {
                 norm.push_back(raw[i + 1]);
                 ++i;
                 continue;
@@ -335,6 +341,11 @@ inline std::string CollapseCurlToFetch(const std::string& rawCurl) {
         << "    method: \"" << pc.method << "\",\r\n";
 
     std::vector<std::pair<std::string, std::string>> allHeaders = pc.headers;
+    if (!pc.basicUser.empty()) {
+        std::string rawCred = pc.basicUser + ":" + pc.basicPass;
+        std::string b64Cred = Base64Encode(reinterpret_cast<const uint8_t*>(rawCred.data()), rawCred.size());
+        allHeaders.emplace_back("Authorization", "Basic " + b64Cred);
+    }
     if (!pc.cookies.empty()) {
         std::string cookieLine;
         for (size_t i = 0; i < pc.cookies.size(); ++i) {
@@ -379,6 +390,11 @@ inline std::string CollapseCurlToHttpFile(const std::string& rawCurl) {
         << pc.method << " " << pc.url << " HTTP/1.1\r\n";
     for (const auto& kv : pc.headers) {
         oss << kv.first << ": " << kv.second << "\r\n";
+    }
+    if (!pc.basicUser.empty()) {
+        std::string rawCred = pc.basicUser + ":" + pc.basicPass;
+        std::string b64Cred = Base64Encode(reinterpret_cast<const uint8_t*>(rawCred.data()), rawCred.size());
+        oss << "Authorization: Basic " << b64Cred << "\r\n";
     }
     if (!pc.cookies.empty()) {
         oss << "Cookie: ";

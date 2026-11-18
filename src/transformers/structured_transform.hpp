@@ -703,12 +703,19 @@ inline std::string CollapseToPythonDataclass(const ValNode& ast, const std::stri
             bool hasDefault;
         };
         std::vector<PyField> reqFields, optFields;
+        std::set<std::string> usedFieldNames;
         for (const auto& key : st.fieldOrder) {
             const auto& fst = *st.fields.at(key);
             bool optional = (st.fieldHitCount.at(key) < st.objectSamples) || fst.hasNull;
             std::string pyKey = ToSnakeCase(key);
             if (kPyKeywords.count(pyKey)) pyKey += "_";
-            std::string baseT = pyTypeExpr(fst, clsName + "_" + key);
+            std::string baseKey = pyKey;
+            int dupIdx = 2;
+            while (usedFieldNames.count(pyKey)) {
+                pyKey = baseKey + "_" + std::to_string(dupIdx++);
+            }
+            usedFieldNames.insert(pyKey);
+            std::string baseT = pyTypeExpr(fst, clsName + "_" + pyKey);
             if (optional) {
                 optFields.push_back({pyKey, "Optional[" + baseT + "] = None", true});
             } else {
@@ -784,10 +791,18 @@ inline std::string CollapseToGoStruct(const ValNode& ast, const std::string& roo
         std::string stName = allocName(hint);
         std::ostringstream oss;
         oss << "type " << stName << " struct {\r\n";
+        std::set<std::string> usedFieldNames;
         for (const auto& key : st.fieldOrder) {
             const auto& fst = *st.fields.at(key);
             bool optional = (st.fieldHitCount.at(key) < st.objectSamples) || fst.hasNull;
-            std::string goField = ToPascalCase(key);
+            std::string baseGoField = ToPascalCase(key);
+            if (baseGoField == "AutoEntity") baseGoField = "Field";
+            std::string goField = baseGoField;
+            int dupIdx = 2;
+            while (usedFieldNames.count(goField)) {
+                goField = baseGoField + std::to_string(dupIdx++);
+            }
+            usedFieldNames.insert(goField);
             std::string baseT = goTypeExpr(fst, stName + goField);
             if (optional && baseT != "any" && !StartsWith(baseT, "[]")) {
                 baseT = "*" + baseT;
@@ -859,10 +874,17 @@ inline std::string CollapseToRustStruct(const ValNode& ast, const std::string& r
         std::ostringstream oss;
         oss << "#[derive(Debug, Clone, Serialize, Deserialize)]\r\n"
             << "pub struct " << stName << " {\r\n";
+        std::set<std::string> usedFieldNames;
         for (const auto& key : st.fieldOrder) {
             const auto& fst = *st.fields.at(key);
             bool optional = (st.fieldHitCount.at(key) < st.objectSamples) || fst.hasNull;
-            std::string snake = ToSnakeCase(key);
+            std::string baseSnake = ToSnakeCase(key);
+            std::string snake = baseSnake;
+            int dupIdx = 2;
+            while (usedFieldNames.count(snake)) {
+                snake = baseSnake + "_" + std::to_string(dupIdx++);
+            }
+            usedFieldNames.insert(snake);
             bool needRename = (snake != key);
             if (kRustKeywords.count(snake)) {
                 snake = "r#" + snake;
@@ -871,7 +893,7 @@ inline std::string CollapseToRustStruct(const ValNode& ast, const std::string& r
             if (needRename) {
                 oss << "    #[serde(rename = \"" << JsonEscape(key) << "\")]\r\n";
             }
-            std::string baseT = rsTypeExpr(fst, stName + ToPascalCase(key));
+            std::string baseT = rsTypeExpr(fst, stName + ToPascalCase(snake));
             if (optional) baseT = "Option<" + baseT + ">";
             oss << "    pub " << snake << ": " << baseT << ",\r\n";
         }
@@ -1324,13 +1346,24 @@ inline std::vector<uint8_t> CollapseToStyledXlsxBytes(const ValNode& ast) {
         sheet << "</cols>";
     }
 
+    auto xmlSafeEscape = [](const std::string& s) -> std::string {
+        std::string cleaned;
+        cleaned.reserve(s.size());
+        for (unsigned char c : s) {
+            if (c >= 0x20 || c == '\t' || c == '\n' || c == '\r') {
+                cleaned.push_back(static_cast<char>(c));
+            }
+        }
+        return HtmlEscape(cleaned);
+    };
+
     sheet << "<sheetData>";
     if (!tbl.columns.empty()) {
         sheet << "<row r=\"1\" ht=\"22\" customHeight=\"1\">";
         for (size_t c = 0; c < tbl.columns.size(); ++c) {
             std::string ref = colLetters(c) + "1";
             sheet << "<c r=\"" << ref << "\" s=\"1\" t=\"inlineStr\"><is><t>"
-                  << HtmlEscape(tbl.columns[c]) << "</t></is></c>";
+                  << xmlSafeEscape(tbl.columns[c]) << "</t></is></c>";
         }
         sheet << "</row>";
 
@@ -1348,7 +1381,7 @@ inline std::vector<uint8_t> CollapseToStyledXlsxBytes(const ValNode& ast) {
                     sheet << "<c r=\"" << ref << "\" s=\"2\" t=\"b\"><v>" << (cell.text == "true" ? "1" : "0") << "</v></c>";
                 } else {
                     sheet << "<c r=\"" << ref << "\" s=\"2\" t=\"inlineStr\"><is><t xml:space=\"preserve\">"
-                          << HtmlEscape(cell.text) << "</t></is></c>";
+                          << xmlSafeEscape(cell.text) << "</t></is></c>";
                 }
             }
             sheet << "</row>";

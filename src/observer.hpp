@@ -172,31 +172,43 @@ inline void ExtractFileMicroContext(const std::string& title, std::string& outFi
     outLang = MicroLangContext::None;
     if (title.empty()) return;
 
-    // Scan candidate tokens separated by spaces, brackets, dashes, bullets, slashes
-    std::string token;
-    auto inspectToken = [&](const std::string& rawTok) -> bool {
-        std::string t = rawTok;
-        // Strip leading/trailing punctuation markers (*, [, ], (, ), ", ', •)
-        while (!t.empty() && (t.front() == '*' || t.front() == '[' || t.front() == '(' ||
-                              t.front() == '"' || t.front() == '\'' || static_cast<unsigned char>(t.front()) >= 0x80)) {
-            if (static_cast<unsigned char>(t.front()) >= 0x80) {
-                // Only strip UTF-8 bullet '●' (E2 97 8F) or '•' (E2 80 A2) if followed by space/ascii, else keep UTF-8 filename!
-                if (StartsWith(t, "\xE2\x97\x8F") || StartsWith(t, "\xE2\x80\xA2")) {
-                    t.erase(0, 3);
-                    continue;
-                }
-                break;
+    auto cleanSegment = [](std::string t) -> std::string {
+        t = Trim(t);
+        // Strip leading dirty/punctuation markers (*, [, (, ", ', ●, •)
+        while (!t.empty()) {
+            if (StartsWith(t, "\xE2\x97\x8F") || StartsWith(t, "\xE2\x80\xA2")) {
+                t = Trim(t.substr(3));
+                continue;
             }
-            t.erase(0, 1);
+            char f = t.front();
+            if (f == '*' || f == '[' || f == '(' || f == '"' || f == '\'') {
+                t = Trim(t.substr(1));
+                continue;
+            }
+            break;
         }
-        while (!t.empty() && (t.back() == '*' || t.back() == ']' || t.back() == ')' ||
-                              t.back() == '"' || t.back() == '\'' || t.back() == ',' || t.back() == ':')) {
-            t.pop_back();
+        // Strip trailing dirty/punctuation markers (*, ], ), ", ', ,, :, ●, •)
+        while (!t.empty()) {
+            if (EndsWith(t, "\xE2\x97\x8F") || EndsWith(t, "\xE2\x80\xA2")) {
+                t = Trim(t.substr(0, t.size() - 3));
+                continue;
+            }
+            char b = t.back();
+            if (b == '*' || b == ']' || b == ')' || b == '"' || b == '\'' || b == ',' || b == ':') {
+                t = Trim(t.substr(0, t.size() - 1));
+                continue;
+            }
+            break;
         }
         size_t slashPos = t.find_last_of("/\\");
         if (slashPos != std::string::npos) {
-            t = t.substr(slashPos + 1);
+            t = Trim(t.substr(slashPos + 1));
         }
+        return t;
+    };
+
+    auto matchCandidate = [&](const std::string& rawCand) -> bool {
+        std::string t = cleanSegment(rawCand);
         size_t dotPos = t.rfind('.');
         if (dotPos != std::string::npos && dotPos > 0 && dotPos + 1 < t.size()) {
             std::string ext = ToLowerAscii(t.substr(dotPos));
@@ -210,11 +222,23 @@ inline void ExtractFileMicroContext(const std::string& title, std::string& outFi
         return false;
     };
 
+    // Pass 1: Split on standard IDE/editor title separators (" - ", " — ", " – ", " | ")
+    // This preserves filenames with spaces such as "my schema.ts - project - Visual Studio Code"
+    std::string normSep = ReplaceAll(title, " \xE2\x80\x94 ", "\n");
+    normSep = ReplaceAll(normSep, " \xE2\x80\x93 ", "\n");
+    normSep = ReplaceAll(normSep, " - ", "\n");
+    normSep = ReplaceAll(normSep, " | ", "\n");
+    for (const auto& seg : SplitLines(normSep)) {
+        if (matchCandidate(seg)) return;
+    }
+
+    // Pass 2: Fallback token scan (handles "schema.ts (Working Tree)" etc.)
+    std::string token;
     for (size_t i = 0; i <= title.size(); ++i) {
         char c = (i < title.size()) ? title[i] : ' ';
         if (c == ' ' || c == '\t' || c == '|' || c == ';') {
             if (!token.empty()) {
-                if (inspectToken(token)) return;
+                if (matchCandidate(token)) return;
                 token.clear();
             }
         } else {
@@ -300,9 +324,10 @@ inline void ClassifyObserverContext(ObserverSnapshot& snap) {
                    lowTitle.find("photopea") != std::string::npos) {
             snap.category = HostCategory::VisualCanvasOrChat;
             snap.detectedFile = "Web Visual Canvas";
-        } else if (lowTitle.find("notion") != std::string::npos ||
-                   lowTitle.find("github") != std::string::npos ||
-                   snap.windowTitle.find("\xE8\xAF\xAD\xE9\x9B\x80") != std::string::npos) { // 语雀
+        } else if (detectedLang == MicroLangContext::None &&
+                   (lowTitle.find("notion") != std::string::npos ||
+                    lowTitle.find("github") != std::string::npos ||
+                    snap.windowTitle.find("\xE8\xAF\xAD\xE9\x9B\x80") != std::string::npos)) { // 语雀
             snap.lang = MicroLangContext::Markdown;
             snap.detectedFile = "Web Markdown Doc";
         }
@@ -436,15 +461,17 @@ public:
             snap.processName = QueryProcessBaseName(snap.foregroundPid);
         }
 
-        // Reconcile when RPC caller is Explorer or a specific pasting desktop host
+        // Reconcile when COM RPC caller PID differs from foreground window PID
+        // (e.g. Explorer background copy worker thread, pasting into an unfocused window,
+        // or an automated COM client calling OleGetClipboard()->GetData while another app is focused)
         if (snap.rpcCallerPid != 0 && snap.rpcCallerPid != GetCurrentProcessId() &&
             snap.rpcCallerPid != snap.foregroundPid && !snap.rpcCallerProcess.empty()) {
             std::string lowCaller = ToLowerAscii(snap.rpcCallerProcess);
-            // If Explorer or Excel/WeChat/etc. is calling GetData directly while focus moved
-            if (lowCaller == "explorer.exe" || lowCaller == "excel.exe" || lowCaller == "et.exe" ||
-                lowCaller == "wechat.exe" || lowCaller == "weixin.exe" || lowCaller == "winword.exe" ||
-                lowCaller == "powerpnt.exe" || lowCaller == "mspaint.exe") {
+            std::string lowFg = ToLowerAscii(snap.processName);
+            if (lowCaller != "dllhost.exe" && lowCaller != "backgroundtaskhost.exe" &&
+                lowFg != "applicationframehost.exe") {
                 snap.processName = snap.rpcCallerProcess;
+                snap.windowTitle.clear();
                 EnumPidWindowCtx enumCtx{snap.rpcCallerPid, L""};
                 EnumWindows(EnumWindowForPidProc, reinterpret_cast<LPARAM>(&enumCtx));
                 if (!enumCtx.bestTitle.empty()) {

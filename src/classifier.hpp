@@ -161,9 +161,18 @@ inline bool LooksLikeCurlCommand(const std::string& t) {
 
 inline bool LooksLikeJsonPayload(const std::string& t) {
     if (t.size() < 2) return false;
+    if (t == "{}" || t == "[]") return true;
     if (!((t.front() == '{' && t.back() == '}') || (t.front() == '[' && t.back() == ']'))) return false;
-    // Ensure balanced top-level quotes/colons/commas heuristic
-    return t.find(':') != std::string::npos || (t.front() == '[' && t.find(',') != std::string::npos);
+    if (t.front() == '{') {
+        return t.find(':') != std::string::npos && t.find('"') != std::string::npos;
+    }
+    // Array: check first non-whitespace inner char looks like valid JSON value start
+    size_t p = 1;
+    while (p + 1 < t.size() && static_cast<unsigned char>(t[p]) <= 0x20) ++p;
+    if (p + 1 >= t.size()) return true;
+    char c = t[p];
+    return c == '{' || c == '[' || c == '"' || c == '-' ||
+           (c >= '0' && c <= '9') || c == 't' || c == 'f' || c == 'n';
 }
 
 inline bool LooksLikeSvgPayload(const std::string& t) {
@@ -184,11 +193,27 @@ inline bool LooksLikeMermaidPayload(const std::string& t) {
 
 inline bool LooksLikeMathLatex(const std::string& t) {
     if ((StartsWith(t, "$$") && EndsWith(t, "$$") && t.size() > 4) ||
+        (StartsWith(t, "\\[") && EndsWith(t, "\\]") && t.size() > 4) ||
         StartsWith(t, "\\begin{equation") || StartsWith(t, "\\begin{align")) {
         return true;
     }
-    return (t.find("\\frac{") != std::string::npos || t.find("\\sum_") != std::string::npos ||
-            t.find("\\int_") != std::string::npos || t.find("\\sqrt{") != std::string::npos);
+    // Single-dollar inline math $...$ containing LaTeX backslash or super/subscripts
+    if (t.size() > 3 && t.front() == '$' && t.back() == '$' && t[1] != '$' &&
+        t.find('\n') == std::string::npos &&
+        (t.find('\\') != std::string::npos || t.find('^') != std::string::npos || t.find('_') != std::string::npos)) {
+        return true;
+    }
+    static const char* kMathMarkers[] = {
+        "\\frac{", "\\sum", "\\int", "\\sqrt{", "\\partial", "\\nabla",
+        "\\hbar", "\\Psi", "\\psi", "\\lim_", "\\infty", "\\hat{", "\\langle", "\\rangle"
+    };
+    int hits = 0;
+    for (const char* m : kMathMarkers) {
+        if (t.find(m) != std::string::npos) ++hits;
+    }
+    return hits >= 1 && (t.find("\\frac{") != std::string::npos ||
+                          t.find("\\sqrt{") != std::string::npos ||
+                          hits >= 2);
 }
 
 inline bool LooksLikeCsvPayload(const std::string& t) {
@@ -378,6 +403,9 @@ inline std::string PredictCollapseTargetLabel(const QuantumSeed& seed, const Obs
     if (obs.lockMode == ManualLockMode::RawBypass) {
         return "Raw Passthrough (反坍缩原味直通)";
     }
+    if (obs.lockMode == ManualLockMode::LockPngCard) {
+        return "Locked 2x HiDPI Visual Card (PNG / CF_DIBV5)";
+    }
 
     switch (seed.kind) {
         case SuperpositionKind::RemoteUrl:
@@ -390,8 +418,10 @@ inline std::string PredictCollapseTargetLabel(const QuantumSeed& seed, const Obs
             if (obs.lang == MicroLangContext::Markdown) {
                 return "Markdown Smart Link [Title](URL)";
             }
-            if (obs.category == HostCategory::VisualCanvasOrChat && seed.looksLikeImageUrl) {
-                return "Decoded High-DPI Bitmap (PNG / CF_DIBV5)";
+            if (obs.category == HostCategory::VisualCanvasOrChat) {
+                return seed.looksLikeImageUrl
+                           ? "Decoded High-DPI Bitmap (PNG / CF_DIBV5)"
+                           : "Lazy Content-Type Probe -> Image Bitmap or URL";
             }
             return "Original URL Text";
 
@@ -429,9 +459,10 @@ inline std::string PredictCollapseTargetLabel(const QuantumSeed& seed, const Obs
                            : "2x HiDPI Visual Card (.png IStream)";
             }
             if (obs.category == HostCategory::VisualCanvasOrChat) {
-                return (seed.visualSyntax == VisualSyntax::Svg)
-                           ? "2x Rasterized Transparent PNG (SVG->Bitmap)"
-                           : "2x Anti-Aliased Syntax Card PNG";
+                if (seed.visualSyntax == VisualSyntax::Svg) return "2x Rasterized Transparent PNG (SVG->Bitmap)";
+                if (seed.visualSyntax == VisualSyntax::Mermaid) return "2x Mermaid Topology Diagram PNG";
+                if (seed.visualSyntax == VisualSyntax::MathLatex) return "2x Typeset Mathematical Formula Card PNG";
+                return "2x Anti-Aliased Syntax Card PNG";
             }
             if (obs.category == HostCategory::RichDocument) {
                 return "Syntax-Highlighted CF_HTML Block";

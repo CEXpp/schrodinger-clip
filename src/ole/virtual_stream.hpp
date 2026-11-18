@@ -72,15 +72,13 @@ public:
             }
         }
 
-        // Stream in 64 KB ~ 256 KB bounded chunks so memory stays strictly < 1 MB
-        const ULONG maxChunk = 262144UL; // 256 KB
-        ULONG target = std::min<ULONG>(cb, maxChunk);
+        // Stream directly into caller buffer in 64 KB WinHTTP slices (0 extra heap bytes, < 1 MB RAM!)
         uint8_t* dst = static_cast<uint8_t*>(pv);
         ULONG accumulated = 0;
 
-        while (accumulated < target) {
+        while (accumulated < cb) {
             DWORD got = 0;
-            ULONG ask = std::min<ULONG>(target - accumulated, 65536UL);
+            ULONG ask = std::min<ULONG>(cb - accumulated, 65536UL);
             if (!WinHttpReadData(hRequest_, dst + accumulated, ask, &got)) {
                 if (accumulated > 0) break;
                 CloseHttpHandles();
@@ -271,12 +269,12 @@ private:
         DWORD status = 0, sz = sizeof(status);
         WinHttpQueryHeaders(hRequest_, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
-        if (status < 200 || status >= 400) {
+        if (status != 200 && status != 206) {
             CloseHttpHandles();
             return false;
         }
 
-        if (!hasKnownSize_ && offset == 0) {
+        if (!hasKnownSize_ && status == 200) {
             wchar_t lenBuf[64] = {};
             DWORD lenBytes = sizeof(lenBuf);
             if (WinHttpQueryHeaders(hRequest_, WINHTTP_QUERY_CONTENT_LENGTH,
@@ -285,6 +283,22 @@ private:
                     knownSize_ = std::stoull(lenBuf);
                     hasKnownSize_ = true;
                 } catch (...) {}
+            }
+        }
+
+        // If offset > 0 and server ignored HTTP Range (returned 200 OK instead of 206 Partial Content),
+        // drain 'offset' bytes in bounded 64 KB chunks so stream cursor remains 100% byte-accurate!
+        if (offset > 0 && status == 200) {
+            std::vector<uint8_t> skipBuf(65536);
+            uint64_t skipped = 0;
+            while (skipped < offset) {
+                DWORD ask = static_cast<DWORD>(std::min<uint64_t>(offset - skipped, skipBuf.size()));
+                DWORD got = 0;
+                if (!WinHttpReadData(hRequest_, skipBuf.data(), ask, &got) || got == 0) {
+                    CloseHttpHandles();
+                    return false;
+                }
+                skipped += got;
             }
         }
         return true;

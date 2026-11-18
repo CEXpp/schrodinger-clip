@@ -161,10 +161,13 @@ private:
         std::string method, path;
         rl >> method >> path;
 
+        std::string rangeHeader;
         size_t contentLen = 0;
         for (const auto& ln : SplitLines(headerBlock)) {
             if (StartsWithIgnoreCase(ln, "Content-Length:")) {
                 try { contentLen = std::stoull(Trim(ln.substr(15))); } catch (...) {}
+            } else if (StartsWithIgnoreCase(ln, "Range:")) {
+                rangeHeader = Trim(ln.substr(6));
             }
         }
 
@@ -175,7 +178,7 @@ private:
             body.append(buf, static_cast<size_t>(n));
         }
 
-        RouteRequest(client, method, path, body);
+        RouteRequest(client, method, path, body, rangeHeader);
         closesocket(client);
     }
 
@@ -187,7 +190,8 @@ private:
         return nullptr;
     }
 
-    void RouteRequest(SOCKET client, const std::string& method, const std::string& path, const std::string& body) {
+    void RouteRequest(SOCKET client, const std::string& method, const std::string& path,
+                      const std::string& body, const std::string& rangeHeader = "") {
         if (method == "OPTIONS") {
             SendHttpResponse(client, 200, "OK", "text/plain", "");
             return;
@@ -198,19 +202,41 @@ private:
             return;
         }
 
-        // Built-in 24 MB Sandbox Virtual File Streaming Endpoint (HEAD + GET)
+        // Built-in 24 MB Sandbox Virtual File Streaming Endpoint (HEAD + GET + HTTP Range 206)
         if (StartsWith(path, "/api/demo-stream/")) {
             const uint64_t kStreamBytes = 24ULL * 1024ULL * 1024ULL; // 25,165,824 bytes
+            uint64_t startByte = 0;
+            bool isPartial = false;
+            if (StartsWithIgnoreCase(rangeHeader, "bytes=")) {
+                std::string spec = rangeHeader.substr(6);
+                size_t dash = spec.find('-');
+                if (dash != std::string::npos && dash > 0) {
+                    try {
+                        uint64_t reqOff = std::stoull(spec.substr(0, dash));
+                        if (reqOff < kStreamBytes) {
+                            startByte = reqOff;
+                            isPartial = true;
+                        }
+                    } catch (...) {}
+                }
+            }
+            uint64_t remBytes = kStreamBytes - startByte;
             std::ostringstream hdr;
-            hdr << "HTTP/1.1 200 OK\r\n"
-                << "Content-Type: application/octet-stream\r\n"
-                << "Content-Length: " << kStreamBytes << "\r\n"
+            if (isPartial) {
+                hdr << "HTTP/1.1 206 Partial Content\r\n"
+                    << "Content-Range: bytes " << startByte << "-" << (kStreamBytes - 1) << "/" << kStreamBytes << "\r\n";
+            } else {
+                hdr << "HTTP/1.1 200 OK\r\n";
+            }
+            hdr << "Content-Type: application/octet-stream\r\n"
+                << "Accept-Ranges: bytes\r\n"
+                << "Content-Length: " << remBytes << "\r\n"
                 << "Connection: close\r\n\r\n";
             std::string h = hdr.str();
             SendAll(client, h.data(), h.size());
             if (method == "GET") {
                 std::vector<char> chunk(65536);
-                uint64_t offset = 0;
+                uint64_t offset = startByte;
                 while (offset < kStreamBytes && running_) {
                     size_t n = static_cast<size_t>(std::min<uint64_t>(chunk.size(), kStreamBytes - offset));
                     for (size_t i = 0; i < n; ++i) {

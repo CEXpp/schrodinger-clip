@@ -112,11 +112,61 @@ private:
         ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 
+    static HRESULT SetOleClipboardWithRetry(IDataObject* pObj, int maxAttempts = 20, DWORD sleepMs = 12) {
+        HRESULT hr = E_FAIL;
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            hr = OleSetClipboard(pObj);
+            if (SUCCEEDED(hr)) return hr;
+            Sleep(sleepMs);
+        }
+        return hr;
+    }
+
+    // The OS clipboard is globally shared: screen-capture / clipboard-manager utilities can
+    // hold it open for a few milliseconds, making a single OleGetClipboard call fail.
+    static HRESULT GetOleClipboardWithRetry(IDataObject** ppObj, int maxAttempts = 20, DWORD sleepMs = 10) {
+        HRESULT hr = E_FAIL;
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            *ppObj = nullptr;
+            hr = OleGetClipboard(ppObj);
+            if (SUCCEEDED(hr) && *ppObj) return hr;
+            if (*ppObj) {
+                (*ppObj)->Release();
+                *ppObj = nullptr;
+            }
+            Sleep(sleepMs);
+        }
+        return hr;
+    }
+
+    // OLE clipboard ownership can be briefly stolen by clipboard managers, so GetData may
+    // surface CLIPBRD_E_CANT_OPEN / RPC_E_CALL_REJECTED even after OleGetClipboard succeeded.
+    static bool IsTransientOleClipboardError(HRESULT hr) {
+        return hr == static_cast<HRESULT>(0x800401D0u) || // CLIPBRD_E_CANT_OPEN
+               hr == static_cast<HRESULT>(0x800401D1u) || // CLIPBRD_E_CANT_EMPTY
+               hr == static_cast<HRESULT>(0x800401D2u) || // CLIPBRD_E_CANT_SET
+               hr == RPC_E_CALL_REJECTED ||
+               hr == RPC_E_SERVERCALL_RETRYLATER;
+    }
+
+    static HRESULT GetDataWithRetry(IDataObject* pObj, FORMATETC* pfmt, STGMEDIUM* pmedium,
+                                    int maxAttempts = 8, DWORD sleepMs = 20) {
+        HRESULT hr = E_FAIL;
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            std::memset(pmedium, 0, sizeof(STGMEDIUM));
+            hr = pObj->GetData(pfmt, pmedium);
+            if (SUCCEEDED(hr)) return hr;
+            if (!IsTransientOleClipboardError(hr)) return hr;
+            Sleep(sleepMs);
+        }
+        return hr;
+    }
+
     bool MountSuperpositionSeed(sclip::QuantumSeed&& seed) {
         isSelfArming_ = true;
         auto* nextObj = new sclip::SuperpositionDataObject(seed, &observerMgr_, &telemetry_);
 
-        HRESULT hr = OleSetClipboard(nextObj);
+        HRESULT hr = SetOleClipboardWithRetry(nextObj);
         if (FAILED(hr)) {
             nextObj->Release();
             isSelfArming_ = false;
@@ -138,7 +188,7 @@ private:
         isSelfArming_ = true;
         if (currentDataObj_) {
             if (OleIsCurrentClipboard(currentDataObj_) == S_OK) {
-                OleSetClipboard(nullptr);
+                SetOleClipboardWithRetry(nullptr);
             }
             currentDataObj_->Release();
             currentDataObj_ = nullptr;
@@ -177,27 +227,44 @@ private:
         if (!opened) return;
 
         bool capturedFiles = false;
+        bool isMoveCutOperation = false;
         std::vector<std::wstring> droppedPaths;
         std::string rawUtf8Text;
         bool capturedText = false;
 
         if (IsClipboardFormatAvailable(CF_HDROP)) {
-            HANDLE hDropData = GetClipboardData(CF_HDROP);
-            if (hDropData) {
-                HDROP hDrop = static_cast<HDROP>(GlobalLock(hDropData));
-                if (hDrop) {
-                    UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-                    for (UINT i = 0; i < count; ++i) {
-                        UINT chars = DragQueryFileW(hDrop, i, nullptr, 0);
-                        if (chars > 0) {
-                            std::wstring p(chars + 1, L'\0');
-                            DragQueryFileW(hDrop, i, &p[0], chars + 1);
-                            p.resize(chars);
-                            droppedPaths.push_back(std::move(p));
+            // Never hijack Ctrl+X Cut/Move (DROPEFFECT_MOVE without DROPEFFECT_COPY) in Explorer!
+            UINT cfPref = sclip::RegisteredFormats::Instance().cfPreferredDropEffect;
+            if (IsClipboardFormatAvailable(cfPref)) {
+                HANDLE hEff = GetClipboardData(cfPref);
+                if (hEff && GlobalSize(hEff) >= sizeof(DWORD)) {
+                    const DWORD* pdw = static_cast<const DWORD*>(GlobalLock(hEff));
+                    if (pdw) {
+                        if ((*pdw & DROPEFFECT_MOVE) != 0 && (*pdw & DROPEFFECT_COPY) == 0) {
+                            isMoveCutOperation = true;
                         }
+                        GlobalUnlock(hEff);
                     }
-                    GlobalUnlock(hDropData);
-                    if (!droppedPaths.empty()) capturedFiles = true;
+                }
+            }
+            if (!isMoveCutOperation) {
+                HANDLE hDropData = GetClipboardData(CF_HDROP);
+                if (hDropData) {
+                    HDROP hDrop = static_cast<HDROP>(GlobalLock(hDropData));
+                    if (hDrop) {
+                        UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+                        for (UINT i = 0; i < count; ++i) {
+                            UINT chars = DragQueryFileW(hDrop, i, nullptr, 0);
+                            if (chars > 0) {
+                                std::wstring p(chars + 1, L'\0');
+                                DragQueryFileW(hDrop, i, &p[0], chars + 1);
+                                p.resize(chars);
+                                droppedPaths.push_back(std::move(p));
+                            }
+                        }
+                        GlobalUnlock(hDropData);
+                        if (!droppedPaths.empty()) capturedFiles = true;
+                    }
                 }
             }
         } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
@@ -219,7 +286,6 @@ private:
             MountSuperpositionSeed(std::move(seed));
         } else if (capturedText) {
             // Only mount superposition when seed matches one of the 5 polymorphic sources
-            // (or mount universal superposition so any text can also inspect telemetry!)
             sclip::QuantumSeed seed = sclip::ClassifyTextSeed(rawUtf8Text, ++envelopeCounter_);
             if (seed.kind != sclip::SuperpositionKind::PlainText) {
                 MountSuperpositionSeed(std::move(seed));
@@ -232,6 +298,14 @@ private:
                 telemetry_.SetActiveSeed(seed);
                 RefreshHudOverlay();
             }
+        } else {
+            // External Move-Cut (Ctrl+X) or non-text clipboard payload (e.g. screenshot): leave untouched!
+            if (currentDataObj_) {
+                currentDataObj_->Release();
+                currentDataObj_ = nullptr;
+            }
+            telemetry_.ClearSeed();
+            RefreshHudOverlay();
         }
     }
 
@@ -250,7 +324,17 @@ private:
         observerMgr_.SetSimulatedObserver(true, preq->processName, preq->windowTitle);
 
         IDataObject* pDataObj = nullptr;
-        HRESULT hr = OleGetClipboard(&pDataObj);
+        HRESULT hr = E_FAIL;
+        // The daemon already owns the live superposition object on this STA thread.
+        // Reusing it avoids contending with third-party clipboard managers that may
+        // briefly hold the shared OS clipboard open (OleGetClipboard -> CLIPBRD_E_CANT_OPEN).
+        if (currentDataObj_ && OleIsCurrentClipboard(currentDataObj_) == S_OK) {
+            pDataObj = currentDataObj_;
+            pDataObj->AddRef();
+            hr = S_OK;
+        } else {
+            hr = GetOleClipboardWithRetry(&pDataObj);
+        }
         if (FAILED(hr) || !pDataObj) {
             observerMgr_.SetSimulatedObserver(false);
             preq->ok = false;
@@ -259,6 +343,64 @@ private:
         }
 
         const auto& rf = sclip::RegisteredFormats::Instance();
+
+        if (preq->requestedKind == "istream") {
+            FORMATETC fmtDesc = {static_cast<CLIPFORMAT>(rf.cfFileDescriptorW), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+            STGMEDIUM stgDesc = {};
+            hr = GetDataWithRetry(pDataObj, &fmtDesc, &stgDesc);
+            if (SUCCEEDED(hr) && stgDesc.tymed == TYMED_HGLOBAL && stgDesc.hGlobal) {
+                const auto* fgd = static_cast<const FILEGROUPDESCRIPTORW*>(GlobalLock(stgDesc.hGlobal));
+                std::string fname = "virtual_output.bin";
+                uint64_t fsize = 0;
+                DWORD flags = 0;
+                if (fgd && fgd->cItems >= 1) {
+                    fname = sclip::WideToUtf8(fgd->fgd[0].cFileName);
+                    fsize = (static_cast<uint64_t>(fgd->fgd[0].nFileSizeHigh) << 32) | fgd->fgd[0].nFileSizeLow;
+                    flags = fgd->fgd[0].dwFlags;
+                }
+                GlobalUnlock(stgDesc.hGlobal);
+                ReleaseStgMedium(&stgDesc);
+
+                FORMATETC fmtFc = {static_cast<CLIPFORMAT>(rf.cfFileContents), nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM};
+                STGMEDIUM stgFc = {};
+                hr = GetDataWithRetry(pDataObj, &fmtFc, &stgFc);
+                if (SUCCEEDED(hr) && stgFc.tymed == TYMED_ISTREAM && stgFc.pstm) {
+                    uint8_t headBytes[32] = {};
+                    ULONG got = 0;
+                    stgFc.pstm->Read(headBytes, sizeof(headBytes), &got);
+                    std::ostringstream hexDump;
+                    for (ULONG i = 0; i < got; ++i) {
+                        char hb[4];
+                        std::snprintf(hb, sizeof(hb), "%02X ", headBytes[i]);
+                        hexDump << hb;
+                    }
+                    ReleaseStgMedium(&stgFc);
+
+                    preq->ok = true;
+                    preq->resultKind = "text";
+                    preq->bytesOut = static_cast<size_t>(fsize > 0 ? fsize : got);
+                    std::ostringstream summary;
+                    summary << "[COM Virtual File Stream Ready via CFSTR_FILEDESCRIPTORW + TYMED_ISTREAM]\r\n"
+                            << "  • Virtual File Name : " << fname << "\r\n"
+                            << "  • Stream Byte Size  : " << fsize << " bytes\r\n"
+                            << "  • Descriptor Flags  : 0x" << std::hex << flags << std::dec
+                            << " (FD_FILESIZE | FD_PROGRESSUI | FD_WRITESTIME)\r\n"
+                            << "  • First " << got << " Stream Bytes: " << hexDump.str() << "\r\n"
+                            << "  ▶ Tip: Switch to any Windows Explorer folder and press Ctrl+V to stream directly to disk!";
+                    preq->textOut = summary.str();
+                } else {
+                    preq->ok = false;
+                    preq->errorMsg = "CFSTR_FILECONTENTS (TYMED_ISTREAM) unavailable";
+                }
+            } else {
+                preq->ok = false;
+                preq->errorMsg = "Current seed or lock mode does not expose a virtual file stream";
+            }
+            pDataObj->Release();
+            observerMgr_.SetSimulatedObserver(false);
+            return;
+        }
+
         FORMATETC fmt = {};
         fmt.dwAspect = DVASPECT_CONTENT;
         fmt.lindex = -1;
@@ -273,7 +415,7 @@ private:
         }
 
         STGMEDIUM stg = {};
-        hr = pDataObj->GetData(&fmt, &stg);
+        hr = GetDataWithRetry(pDataObj, &fmt, &stg);
         if (SUCCEEDED(hr) && stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
             size_t sz = GlobalSize(stg.hGlobal);
             const uint8_t* ptr = static_cast<const uint8_t*>(GlobalLock(stg.hGlobal));
@@ -356,7 +498,7 @@ private:
         // Cleanly release OLE clipboard ownership without forcing eager evaluation
         if (currentDataObj_) {
             if (OleIsCurrentClipboard(currentDataObj_) == S_OK) {
-                OleSetClipboard(nullptr);
+                SetOleClipboardWithRetry(nullptr);
             }
             currentDataObj_->Release();
             currentDataObj_ = nullptr;

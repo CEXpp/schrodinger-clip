@@ -403,6 +403,328 @@ inline RenderedImageBundle RenderCodeCardBitmap2x(const std::string& rawCode,
 }
 
 // ============================================================================
+// 2x HiDPI Mathematical LaTeX Formula Typesetting Card Renderer
+// ============================================================================
+
+inline std::wstring ConvertLatexFragmentToMathUnicode(const std::string& raw) {
+    std::string s = Trim(raw);
+    // Replace common LaTeX commands with mathematical Unicode symbols
+    static const std::pair<const char*, const char*> kMap[] = {
+        {"\\hbar", "\xE2\x84\x8F"},        // ℏ
+        {"\\partial", "\xE2\x88\x82"},     // ∂
+        {"\\nabla", "\xE2\x88\x87"},       // ∇
+        {"\\infty", "\xE2\x88\x9E"},       // ∞
+        {"\\int", "\xE2\x88\xAB"},         // ∫
+        {"\\oint", "\xE2\x88\xAE"},        // ∮
+        {"\\sum", "\xE2\x88\x91"},         // ∑
+        {"\\prod", "\xE2\x88\x8F"},        // ∏
+        {"\\pm", "\xC2\xB1"},              // ±
+        {"\\mp", "\xE2\x88\x93"},          // ∓
+        {"\\times", "\xC3\x97"},           // ×
+        {"\\cdot", "\xC2\xB7"},            // ·
+        {"\\leq", "\xE2\x89\xA4"},         // ≤
+        {"\\le", "\xE2\x89\xA4"},          // ≤
+        {"\\geq", "\xE2\x89\xA5"},         // ≥
+        {"\\ge", "\xE2\x89\xA5"},          // ≥
+        {"\\neq", "\xE2\x89\xA0"},         // ≠
+        {"\\ne", "\xE2\x89\xA0"},          // ≠
+        {"\\approx", "\xE2\x89\x88"},      // ≈
+        {"\\equiv", "\xE2\x89\xA1"},       // ≡
+        {"\\Rightarrow", "\xE2\x87\x92"},  // ⇒
+        {"\\rightarrow", "\xE2\x86\x92"},  // →
+        {"\\to", "\xE2\x86\x92"},          // →
+        {"\\leftarrow", "\xE2\x86\x90"},   // ←
+        {"\\langle", "\xE2\x9F\xA8"},      // ⟨
+        {"\\rangle", "\xE2\x9F\xA9"},      // ⟩
+        {"\\forall", "\xE2\x88\x80"},      // ∀
+        {"\\exists", "\xE2\x88\x83"},      // ∃
+        {"\\in", "\xE2\x88\x88"},          // ∈
+        {"\\Psi", "\xCE\xA8"},             // Ψ
+        {"\\psi", "\xCF\x88"},             // ψ
+        {"\\Phi", "\xCE\xA6"},             // Φ
+        {"\\phi", "\xCF\x86"},             // φ
+        {"\\Delta", "\xCE\x94"},           // Δ
+        {"\\Gamma", "\xCE\x93"},           // Γ
+        {"\\Lambda", "\xCE\x9B"},          // Λ
+        {"\\Omega", "\xCE\xA9"},           // Ω
+        {"\\omega", "\xCF\x89"},           // ω
+        {"\\Sigma", "\xCE\xA3"},           // Σ
+        {"\\sigma", "\xCF\x83"},           // σ
+        {"\\alpha", "\xCE\xB1"},           // α
+        {"\\beta", "\xCE\xB2"},            // β
+        {"\\gamma", "\xCE\xB3"},           // γ
+        {"\\delta", "\xCE\xB4"},           // δ
+        {"\\epsilon", "\xCE\xB5"},         // ε
+        {"\\theta", "\xCE\xB8"},           // θ
+        {"\\lambda", "\xCE\xBB"},          // λ
+        {"\\mu", "\xCE\xBC"},              // μ
+        {"\\pi", "\xCF\x80"},              // π
+        {"\\rho", "\xCF\x81"},             // ρ
+        {"\\tau", "\xCF\x84"},             // τ
+        {"\\quad", "  "},
+        {"\\,", " "},
+        {"\\;", " "},
+        {"\\left", ""},
+        {"\\right", ""}
+    };
+
+    // Handle \hat{X} -> X + combining circumflex (U+0302) and \sqrt{X} -> √(X)
+    auto extractBraced = [](const std::string& src, size_t openPos, std::string& inner, size_t& afterPos) -> bool {
+        if (openPos >= src.size() || src[openPos] != '{') return false;
+        int depth = 0;
+        for (size_t i = openPos; i < src.size(); ++i) {
+            if (src[i] == '{') ++depth;
+            else if (src[i] == '}') {
+                --depth;
+                if (depth == 0) {
+                    inner = src.substr(openPos + 1, i - openPos - 1);
+                    afterPos = i + 1;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    size_t p = 0;
+    while ((p = s.find("\\hat{", p)) != std::string::npos) {
+        std::string inner; size_t after = 0;
+        if (extractBraced(s, p + 4, inner, after)) {
+            s = s.substr(0, p) + inner + "\xCC\x82" + s.substr(after);
+        } else break;
+    }
+    p = 0;
+    while ((p = s.find("\\mathbf{", p)) != std::string::npos) {
+        std::string inner; size_t after = 0;
+        if (extractBraced(s, p + 7, inner, after)) {
+            s = s.substr(0, p) + inner + s.substr(after);
+        } else break;
+    }
+    p = 0;
+    while ((p = s.find("\\sqrt{", p)) != std::string::npos) {
+        std::string inner; size_t after = 0;
+        if (extractBraced(s, p + 5, inner, after)) {
+            s = s.substr(0, p) + "\xE2\x88\x9A(" + inner + ")" + s.substr(after);
+        } else break;
+    }
+    // Nested \frac inside numerator/denominator fallback -> (a)/(b)
+    p = 0;
+    while ((p = s.find("\\frac{", p)) != std::string::npos) {
+        std::string num, den; size_t after1 = 0, after2 = 0;
+        if (extractBraced(s, p + 5, num, after1) && extractBraced(s, after1, den, after2)) {
+            s = s.substr(0, p) + "(" + num + ")/(" + den + ")" + s.substr(after2);
+        } else break;
+    }
+
+    for (const auto& kv : kMap) {
+        s = ReplaceAll(s, kv.first, kv.second);
+    }
+
+    // Strip remaining bare braces around super/subscripts cleanly
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if ((s[i] == '^' || s[i] == '_') && i + 1 < s.size()) {
+            bool sup = (s[i] == '^');
+            std::string subInner;
+            size_t after = 0;
+            if (s[i + 1] == '{' && extractBraced(s, i + 1, subInner, after)) {
+                i = after - 1;
+            } else {
+                subInner = std::string(1, s[++i]);
+            }
+            auto mapScriptChar = [&](char ch) -> std::string {
+                if (sup) {
+                    switch (ch) {
+                        case '0': return "\xE2\x81\xB0"; case '1': return "\xC2\xB9";
+                        case '2': return "\xC2\xB2";     case '3': return "\xC2\xB3";
+                        case '4': return "\xE2\x81\xB4"; case '5': return "\xE2\x81\xB5";
+                        case '6': return "\xE2\x81\xB6"; case '7': return "\xE2\x81\xB7";
+                        case '8': return "\xE2\x81\xB8"; case '9': return "\xE2\x81\xB9";
+                        case '+': return "\xE2\x81\xBA"; case '-': return "\xE2\x81\xBB";
+                        case 'n': return "\xE2\x81\xBF"; case 'i': return "\xE2\x81\xB1";
+                        default: return "";
+                    }
+                } else {
+                    switch (ch) {
+                        case '0': return "\xE2\x82\x80"; case '1': return "\xE2\x82\x81";
+                        case '2': return "\xE2\x82\x82"; case '3': return "\xE2\x82\x83";
+                        case '4': return "\xE2\x82\x84"; case '5': return "\xE2\x82\x85";
+                        case '6': return "\xE2\x82\x86"; case '7': return "\xE2\x82\x87";
+                        case '8': return "\xE2\x82\x88"; case '9': return "\xE2\x82\x89";
+                        case '+': return "\xE2\x82\x8A"; case '-': return "\xE2\x82\x8B";
+                        case 'i': return "\xE1\xB5\xA2"; case 'j': return "\xE2\xB1\xBC";
+                        case 'k': return "\xE2\x82\x96"; case 'n': return "\xE2\x82\x99";
+                        case 't': return "\xE2\x82\x9C"; case 'x': return "\xE2\x82\x93";
+                        default: return "";
+                    }
+                }
+            };
+            std::string mapped;
+            bool allMapped = !subInner.empty();
+            for (char ch : subInner) {
+                std::string m = mapScriptChar(ch);
+                if (m.empty()) { allMapped = false; break; }
+                mapped += m;
+            }
+            if (allMapped) out += mapped;
+            else out += (sup ? "^(" : "_(") + subInner + ")";
+        } else if (s[i] != '{' && s[i] != '}') {
+            out.push_back(s[i]);
+        }
+    }
+    return Utf8ToWide(out);
+}
+
+inline RenderedImageBundle RenderMathFormulaBitmap2x(const std::string& rawLatex) {
+    std::string clean = Trim(rawLatex);
+    if (StartsWith(clean, "$$") && EndsWith(clean, "$$") && clean.size() > 4) {
+        clean = Trim(clean.substr(2, clean.size() - 4));
+    } else if (StartsWith(clean, "\\[") && EndsWith(clean, "\\]") && clean.size() > 4) {
+        clean = Trim(clean.substr(2, clean.size() - 4));
+    } else if (clean.size() > 2 && clean.front() == '$' && clean.back() == '$') {
+        clean = Trim(clean.substr(1, clean.size() - 2));
+    }
+    clean = ReplaceAll(ReplaceAll(clean, "\\begin{equation}", ""), "\\end{equation}", "");
+    clean = ReplaceAll(ReplaceAll(clean, "\\begin{align}", ""), "\\end{align}", "");
+    clean = Trim(clean);
+
+    // Split into horizontal segments: Plain math run vs 2D stacked \frac{num}{den}
+    struct MathAtom {
+        bool isFraction = false;
+        std::wstring text;
+        std::wstring num;
+        std::wstring den;
+        float width = 0.0f;
+    };
+    std::vector<MathAtom> atoms;
+    auto extractBraced = [](const std::string& src, size_t openPos, std::string& inner, size_t& afterPos) -> bool {
+        if (openPos >= src.size() || src[openPos] != '{') return false;
+        int depth = 0;
+        for (size_t i = openPos; i < src.size(); ++i) {
+            if (src[i] == '{') ++depth;
+            else if (src[i] == '}') {
+                --depth;
+                if (depth == 0) {
+                    inner = src.substr(openPos + 1, i - openPos - 1);
+                    afterPos = i + 1;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    size_t cursor = 0;
+    while (cursor < clean.size()) {
+        size_t fracPos = clean.find("\\frac{", cursor);
+        if (fracPos == std::string::npos) {
+            std::wstring tail = ConvertLatexFragmentToMathUnicode(clean.substr(cursor));
+            if (!tail.empty()) atoms.push_back({false, tail, L"", L"", 0.0f});
+            break;
+        }
+        if (fracPos > cursor) {
+            std::wstring pre = ConvertLatexFragmentToMathUnicode(clean.substr(cursor, fracPos - cursor));
+            if (!pre.empty()) atoms.push_back({false, pre, L"", L"", 0.0f});
+        }
+        std::string numRaw, denRaw;
+        size_t afterNum = 0, afterDen = 0;
+        if (extractBraced(clean, fracPos + 5, numRaw, afterNum) &&
+            extractBraced(clean, afterNum, denRaw, afterDen)) {
+            atoms.push_back({true, L"", ConvertLatexFragmentToMathUnicode(numRaw),
+                             ConvertLatexFragmentToMathUnicode(denRaw), 0.0f});
+            cursor = afterDen;
+        } else {
+            atoms.push_back({false, ConvertLatexFragmentToMathUnicode(clean.substr(fracPos)), L"", L"", 0.0f});
+            break;
+        }
+    }
+
+    // Measure atoms with Cambria Math (fallback Segoe UI Symbol)
+    Gdiplus::Bitmap probeBmp(16, 16, PixelFormat32bppARGB);
+    Gdiplus::Graphics probeG(&probeBmp);
+    Gdiplus::Font mainFont(L"Cambria Math", 44.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font fracFont(L"Cambria Math", 31.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::StringFormat typo(Gdiplus::StringFormat::GenericTypographic());
+    typo.SetFormatFlags(Gdiplus::StringFormatFlagsMeasureTrailingSpaces | Gdiplus::StringFormatFlagsNoWrap);
+
+    float totalFormulaW = 0.0f;
+    bool hasAnyFrac = false;
+    for (auto& a : atoms) {
+        if (!a.isFraction) {
+            Gdiplus::RectF box;
+            probeG.MeasureString(a.text.c_str(), -1, &mainFont, Gdiplus::PointF(0, 0), &typo, &box);
+            a.width = box.Width + 6.0f;
+        } else {
+            hasAnyFrac = true;
+            Gdiplus::RectF bNum, bDen;
+            probeG.MeasureString(a.num.c_str(), -1, &fracFont, Gdiplus::PointF(0, 0), &typo, &bNum);
+            probeG.MeasureString(a.den.c_str(), -1, &fracFont, Gdiplus::PointF(0, 0), &typo, &bDen);
+            a.width = std::max(bNum.Width, bDen.Width) + 28.0f;
+        }
+        totalFormulaW += a.width;
+    }
+
+    const float margin = 32.0f;
+    int cardW = std::max(780, std::min(1840, static_cast<int>(totalFormulaW + 140.0f)));
+    int cardH = hasAnyFrac ? 290 : 240;
+    int imgW = cardW + static_cast<int>(margin * 2.0f);
+    int imgH = cardH + static_cast<int>(margin * 2.0f);
+
+    Gdiplus::Bitmap bmp(imgW, imgH, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics g(&bmp);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+        Gdiplus::GraphicsPath cardPath;
+        AddRoundedRectPath(cardPath, margin, margin, static_cast<float>(cardW), static_cast<float>(cardH), 26.0f);
+        Gdiplus::LinearGradientBrush bgBrush(
+            Gdiplus::PointF(margin, margin),
+            Gdiplus::PointF(margin, margin + static_cast<float>(cardH)),
+            Gdiplus::Color(255, 15, 23, 42),
+            Gdiplus::Color(255, 9, 13, 24));
+        g.FillPath(&bgBrush, &cardPath);
+        Gdiplus::Pen borderPen(Gdiplus::Color(230, 168, 85, 247), 2.5f);
+        g.DrawPath(&borderPen, &cardPath);
+
+        Gdiplus::Font hdrFont(L"Consolas", 17.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush hdrBr(Gdiplus::Color(225, 192, 132, 252));
+        g.DrawString(L"\xCE\xA8 QUANTUM EQUATION TYPESETTER // 2X HIDPI", -1, &hdrFont,
+                     Gdiplus::PointF(margin + 34.0f, margin + 24.0f), &hdrBr);
+
+        float centerY = margin + (hasAnyFrac ? 148.0f : 126.0f);
+        float curX = margin + std::max(44.0f, (static_cast<float>(cardW) - totalFormulaW) * 0.5f);
+
+        Gdiplus::SolidBrush mathBr(Gdiplus::Color(255, 248, 250, 252));
+        Gdiplus::Pen barPen(Gdiplus::Color(255, 125, 211, 252), 2.8f);
+        Gdiplus::StringFormat centerFmt;
+        centerFmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+
+        for (const auto& a : atoms) {
+            if (!a.isFraction) {
+                g.DrawString(a.text.c_str(), -1, &mainFont, Gdiplus::PointF(curX, centerY - 28.0f), &typo, &mathBr);
+            } else {
+                float midX = curX + a.width * 0.5f;
+                g.DrawString(a.num.c_str(), -1, &fracFont, Gdiplus::PointF(midX, centerY - 46.0f), &centerFmt, &mathBr);
+                g.DrawLine(&barPen, curX + 8.0f, centerY - 4.0f, curX + a.width - 8.0f, centerY - 4.0f);
+                g.DrawString(a.den.c_str(), -1, &fracFont, Gdiplus::PointF(midX, centerY + 4.0f), &centerFmt, &mathBr);
+            }
+            curX += a.width;
+        }
+
+        // Subtle raw LaTeX footer
+        std::string rawFoot = clean.size() > 88 ? (clean.substr(0, 85) + "...") : clean;
+        std::wstring wFoot = Utf8ToWide("LaTeX: " + rawFoot);
+        Gdiplus::Font footFont(L"Consolas", 15.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush footBr(Gdiplus::Color(165, 148, 163, 184));
+        g.DrawString(wFoot.c_str(), -1, &footFont,
+                     Gdiplus::PointF(margin + 34.0f, margin + static_cast<float>(cardH) - 36.0f), &footBr);
+    }
+    return EncodeGdiplusBitmapBundle(bmp);
+}
+
+// ============================================================================
 // 2x HiDPI Designer #HEX Color Swatch Card Renderer
 // ============================================================================
 
@@ -650,11 +972,78 @@ inline void ParseSvgPathData(const std::string& d, Gdiplus::GraphicsPath& path) 
             lastCtrlX = qx; lastCtrlY = qy;
             cx = x; cy = y;
         } else if (up == 'A') {
-            // Consume SVG elliptical arc args (rx ry rot largeArc sweep x y) and approximate smoothly
-            (void)nextNum(); (void)nextNum(); (void)nextNum(); (void)nextNum(); (void)nextNum();
+            float rx = std::fabs(nextNum());
+            float ry = std::fabs(nextNum());
+            float xAxisRotDeg = nextNum();
+            float largeArcFlag = nextNum();
+            float sweepFlag = nextNum();
             float x = nextNum(), y = nextNum();
             if (rel) { x += cx; y += cy; }
-            path.AddLine(cx, cy, x, y);
+
+            if (rx < 1e-4f || ry < 1e-4f || (std::fabs(x - cx) < 1e-4f && std::fabs(y - cy) < 1e-4f)) {
+                path.AddLine(cx, cy, x, y);
+            } else {
+                // W3C SVG F.6.5 Endpoint-to-Center Elliptical Arc -> Cubic Bezier segments
+                const double pi = 3.14159265358979323846;
+                double phi = static_cast<double>(xAxisRotDeg) * pi / 180.0;
+                double cosPhi = std::cos(phi), sinPhi = std::sin(phi);
+                double dx2 = (cx - x) * 0.5, dy2 = (cy - y) * 0.5;
+                double x1p = cosPhi * dx2 + sinPhi * dy2;
+                double y1p = -sinPhi * dx2 + cosPhi * dy2;
+
+                double rxSq = static_cast<double>(rx) * rx, rySq = static_cast<double>(ry) * ry;
+                double x1pSq = x1p * x1p, y1pSq = y1p * y1p;
+                double lam = x1pSq / rxSq + y1pSq / rySq;
+                double rxd = rx, ryd = ry;
+                if (lam > 1.0) {
+                    double s = std::sqrt(lam);
+                    rxd *= s; ryd *= s;
+                    rxSq = rxd * rxd; rySq = ryd * ryd;
+                }
+                double num = std::max(0.0, rxSq * rySq - rxSq * y1pSq - rySq * x1pSq);
+                double den = rxSq * y1pSq + rySq * x1pSq;
+                double coef = (den > 1e-12) ? std::sqrt(num / den) : 0.0;
+                if ((largeArcFlag > 0.5f) == (sweepFlag > 0.5f)) coef = -coef;
+                double cxp = coef * (rxd * y1p / ryd);
+                double cyp = coef * (-ryd * x1p / rxd);
+                double centerX = cosPhi * cxp - sinPhi * cyp + (cx + x) * 0.5;
+                double centerY = sinPhi * cxp + cosPhi * cyp + (cy + y) * 0.5;
+
+                auto vecAngle = [](double ux, double uy, double vx, double vy) {
+                    double dot = ux * vx + uy * vy;
+                    double len = std::sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+                    double ang = (len > 1e-12) ? std::acos(std::max(-1.0, std::min(1.0, dot / len))) : 0.0;
+                    return (ux * vy - uy * vx < 0.0) ? -ang : ang;
+                };
+                double ux = (x1p - cxp) / rxd, uy = (y1p - cyp) / ryd;
+                double vx = (-x1p - cxp) / rxd, vy = (-y1p - cyp) / ryd;
+                double theta1 = vecAngle(1.0, 0.0, ux, uy);
+                double dTheta = vecAngle(ux, uy, vx, vy);
+                if (sweepFlag <= 0.5f && dTheta > 0.0) dTheta -= 2.0 * pi;
+                else if (sweepFlag > 0.5f && dTheta < 0.0) dTheta += 2.0 * pi;
+
+                int segs = std::max(1, static_cast<int>(std::ceil(std::fabs(dTheta) / (pi * 0.5))));
+                double step = dTheta / segs;
+                double alpha = (4.0 / 3.0) * std::tan(step * 0.25);
+                double prevX = cx, prevY = cy;
+                for (int s = 0; s < segs; ++s) {
+                    double a0 = theta1 + s * step;
+                    double a1 = a0 + step;
+                    double cos0 = std::cos(a0), sin0 = std::sin(a0);
+                    double cos1 = std::cos(a1), sin1 = std::sin(a1);
+                    auto mapPt = [&](double ex, double ey, float& ox, float& oy) {
+                        ox = static_cast<float>(centerX + cosPhi * rxd * ex - sinPhi * ryd * ey);
+                        oy = static_cast<float>(centerY + sinPhi * rxd * ex + cosPhi * ryd * ey);
+                    };
+                    float c1x, c1y, c2x, c2y, p2x, p2y;
+                    mapPt(cos0 - alpha * sin0, sin0 + alpha * cos0, c1x, c1y);
+                    mapPt(cos1 + alpha * sin1, sin1 - alpha * cos1, c2x, c2y);
+                    mapPt(cos1, sin1, p2x, p2y);
+                    path.AddBezier(static_cast<float>(prevX), static_cast<float>(prevY), c1x, c1y, c2x, c2y, p2x, p2y);
+                    prevX = p2x; prevY = p2y;
+                }
+            }
+            lastCtrlX = x; lastCtrlY = y;
             cx = x; cy = y;
         } else {
             (void)nextNum();

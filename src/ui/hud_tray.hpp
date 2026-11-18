@@ -32,12 +32,17 @@ public:
         wc.lpszClassName = L"SchrodingerClipMicroHudWnd";
         RegisterClassExW(&wc);
 
+        HDC screenDc = GetDC(nullptr);
+        int dpiX = screenDc ? GetDeviceCaps(screenDc, LOGPIXELSX) : 96;
+        if (screenDc) ReleaseDC(nullptr, screenDc);
+        dpiScale_ = std::max(1.0f, static_cast<float>(dpiX) / 96.0f);
+
         RECT workArea = {};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-        int w = 460;
-        int h = 68;
-        int x = workArea.right - w - 20;
-        int y = workArea.bottom - h - 18;
+        int w = static_cast<int>(460.0f * dpiScale_);
+        int h = static_cast<int>(68.0f * dpiScale_);
+        int x = workArea.right - w - static_cast<int>(20.0f * dpiScale_);
+        int y = workArea.bottom - h - static_cast<int>(18.0f * dpiScale_);
 
         DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
         hwnd_ = CreateWindowExW(exStyle, wc.lpszClassName, L"SchrodingerClip HUD",
@@ -45,7 +50,8 @@ public:
         if (!hwnd_) return false;
 
         SetLayeredWindowAttributes(hwnd_, 0, 232, LWA_ALPHA);
-        HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 18, 18);
+        int rad = static_cast<int>(18.0f * dpiScale_);
+        HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, rad, rad);
         SetWindowRgn(hwnd_, rgn, TRUE);
 
         visible_ = initiallyVisible;
@@ -84,6 +90,7 @@ private:
     HWND hwnd_ = nullptr;
     bool visible_ = false;
     bool isBypass_ = false;
+    float dpiScale_ = 1.0f;
     std::wstring topLine_ = L"SCHRÖDINGER·CLIP // STANDBY (0 Bytes)";
     std::wstring bottomLine_ = L"Press Ctrl+C on URL / JSON / SVG / cURL / #HEX";
 
@@ -117,34 +124,45 @@ private:
     void PaintHud(HWND hwnd, HDC hdc) {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        Gdiplus::Graphics g(hdc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+        int w = std::max<int>(1, rc.right - rc.left);
+        int h = std::max<int>(1, rc.bottom - rc.top);
 
-        Gdiplus::SolidBrush bg(Gdiplus::Color(255, 11, 17, 32));
-        g.FillRectangle(&bg, 0, 0, rc.right, rc.bottom);
+        // Flicker-free offscreen double-buffer + HiDPI scaling
+        Gdiplus::Bitmap backBuf(w, h, PixelFormat32bppARGB);
+        {
+            Gdiplus::Graphics g(&backBuf);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-        Gdiplus::Color accent = isBypass_ ? Gdiplus::Color(255, 245, 158, 11)
-                                          : Gdiplus::Color(255, 56, 189, 248);
-        Gdiplus::SolidBrush barBr(accent);
-        g.FillRectangle(&barBr, 0, 0, 5, rc.bottom);
+            Gdiplus::SolidBrush bg(Gdiplus::Color(255, 11, 17, 32));
+            g.FillRectangle(&bg, 0, 0, w, h);
 
-        Gdiplus::Pen borderPen(accent, 1.5f);
-        g.DrawRectangle(&borderPen, 1, 1, rc.right - 3, rc.bottom - 3);
+            Gdiplus::Color accent = isBypass_ ? Gdiplus::Color(255, 245, 158, 11)
+                                              : Gdiplus::Color(255, 56, 189, 248);
+            Gdiplus::SolidBrush barBr(accent);
+            g.FillRectangle(&barBr, 0, 0, static_cast<int>(5.0f * dpiScale_), h);
 
-        Gdiplus::Font fTop(L"Consolas", 11.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-        Gdiplus::Font fBot(L"Segoe UI", 12.5f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush topBr(accent);
-        Gdiplus::SolidBrush botBr(Gdiplus::Color(255, 226, 232, 240));
+            Gdiplus::Pen borderPen(accent, 1.5f * dpiScale_);
+            g.DrawRectangle(&borderPen, 1, 1, w - 3, h - 3);
 
-        Gdiplus::RectF rTop(14.0f, 10.0f, static_cast<float>(rc.right - 22), 22.0f);
-        Gdiplus::RectF rBot(14.0f, 35.0f, static_cast<float>(rc.right - 22), 24.0f);
-        Gdiplus::StringFormat sf;
-        sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-        sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            Gdiplus::Font fTop(L"Consolas", 11.5f * dpiScale_, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+            Gdiplus::Font fBot(L"Segoe UI", 12.5f * dpiScale_, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Gdiplus::SolidBrush topBr(accent);
+            Gdiplus::SolidBrush botBr(Gdiplus::Color(255, 226, 232, 240));
 
-        g.DrawString(topLine_.c_str(), -1, &fTop, rTop, &sf, &topBr);
-        g.DrawString(bottomLine_.c_str(), -1, &fBot, rBot, &sf, &botBr);
+            float padL = 14.0f * dpiScale_;
+            Gdiplus::RectF rTop(padL, 10.0f * dpiScale_, static_cast<float>(w) - padL - 8.0f * dpiScale_, 22.0f * dpiScale_);
+            Gdiplus::RectF rBot(padL, 35.0f * dpiScale_, static_cast<float>(w) - padL - 8.0f * dpiScale_, 24.0f * dpiScale_);
+            Gdiplus::StringFormat sf;
+            sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+            g.DrawString(topLine_.c_str(), -1, &fTop, rTop, &sf, &topBr);
+            g.DrawString(bottomLine_.c_str(), -1, &fBot, rBot, &sf, &botBr);
+        }
+
+        Gdiplus::Graphics screenG(hdc);
+        screenG.DrawImage(&backBuf, 0, 0);
     }
 };
 
@@ -187,6 +205,7 @@ public:
         GetCursorPos(&pt);
         SetForegroundWindow(hwnd);
         TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+        PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(hMenu);
     }
 

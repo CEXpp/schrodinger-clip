@@ -180,47 +180,103 @@ bool PutRawTextOnOsClipboard(const std::string& utf8Text) {
     return false;
 }
 
-bool ReadComClipboardUnicodeText(std::string& outUtf8) {
-    outUtf8.clear();
-    IDataObject* pObj = nullptr;
-    if (FAILED(OleGetClipboard(&pObj)) || !pObj) return false;
-
-    FORMATETC fmt = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM stg = {};
-    bool ok = false;
-    if (SUCCEEDED(pObj->GetData(&fmt, &stg)) && stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
-        const wchar_t* wptr = static_cast<const wchar_t*>(GlobalLock(stg.hGlobal));
-        if (wptr) {
-            outUtf8 = sclip::WideToUtf8(std::wstring(wptr));
-            ok = true;
-            GlobalUnlock(stg.hGlobal);
-        }
-        ReleaseStgMedium(&stg);
+// The Windows clipboard is a globally shared, ephemeral resource: screen-capture tools,
+// clipboard managers and Win+V components regularly hold it open for a few milliseconds.
+// Any production-grade client (and this verification suite) must tolerate CLIPBRD_E_CANT_OPEN.
+IDataObject* AcquireComClipboard(int maxAttempts = 40, DWORD sleepMs = 10) {
+    for (int i = 0; i < maxAttempts; ++i) {
+        IDataObject* pObj = nullptr;
+        if (SUCCEEDED(OleGetClipboard(&pObj)) && pObj != nullptr) return pObj;
+        Sleep(sleepMs);
     }
-    pObj->Release();
-    return ok;
+    return nullptr;
+}
+
+// OLE clipboard reads may surface CLIPBRD_E_CANT_OPEN / RPC_E_CALL_REJECTED while a
+// third-party clipboard manager briefly owns the shared OS clipboard.
+bool IsTransientClipboardError(HRESULT hr) {
+    return hr == static_cast<HRESULT>(0x800401D0u) || // CLIPBRD_E_CANT_OPEN
+           hr == static_cast<HRESULT>(0x800401D1u) || // CLIPBRD_E_CANT_EMPTY
+           hr == static_cast<HRESULT>(0x800401D2u) || // CLIPBRD_E_CANT_SET
+           hr == RPC_E_CALL_REJECTED ||
+           hr == RPC_E_SERVERCALL_RETRYLATER;
+}
+
+HRESULT GetDataWithRetry(IDataObject* obj, FORMATETC* fmt, STGMEDIUM* stg, int maxAttempts = 8) {
+    HRESULT hr = E_FAIL;
+    for (int i = 0; i < maxAttempts; ++i) {
+        std::memset(stg, 0, sizeof(*stg));
+        hr = obj->GetData(fmt, stg);
+        if (SUCCEEDED(hr)) return hr;
+        if (!IsTransientClipboardError(hr)) return hr;
+        Sleep(20);
+    }
+    return hr;
+}
+
+// Arm a seed through the daemon API and confirm the STA thread really mounted the envelope.
+// Retries only when the OS clipboard is transiently locked by a third-party process.
+bool ArmSeedViaApi(uint16_t daemonPort, const std::string& jsonBody, int maxAttempts = 6) {
+    for (int i = 0; i < maxAttempts; ++i) {
+        std::string resp = HttpRequestLocal(daemonPort, L"POST", L"/api/arm", jsonBody);
+        if (resp.find("\"ok\":true") != std::string::npos) return true;
+        Sleep(80);
+    }
+    std::fprintf(stderr, "  [WARN] /api/arm did not mount the superposition envelope\n");
+    return false;
+}
+
+bool ReadComClipboardUnicodeText(std::string& outUtf8) {
+    // Retry the whole OLE read: besides the initial OleGetClipboard, OLE may return
+    // CLIPBRD_E_CANT_OPEN from GetData while a clipboard manager briefly owns the clipboard.
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        outUtf8.clear();
+        IDataObject* pObj = AcquireComClipboard(20, 10);
+        if (!pObj) continue;
+
+        FORMATETC fmt = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM stg = {};
+        bool ok = false;
+        if (SUCCEEDED(pObj->GetData(&fmt, &stg)) && stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
+            const wchar_t* wptr = static_cast<const wchar_t*>(GlobalLock(stg.hGlobal));
+            if (wptr) {
+                outUtf8 = sclip::WideToUtf8(std::wstring(wptr));
+                ok = true;
+                GlobalUnlock(stg.hGlobal);
+            }
+            ReleaseStgMedium(&stg);
+        }
+        pObj->Release();
+        if (ok) return true;
+        Sleep(20);
+    }
+    return false;
 }
 
 bool ReadComClipboardBytes(UINT cf, std::vector<uint8_t>& outBytes) {
-    outBytes.clear();
-    IDataObject* pObj = nullptr;
-    if (FAILED(OleGetClipboard(&pObj)) || !pObj) return false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        outBytes.clear();
+        IDataObject* pObj = AcquireComClipboard(20, 10);
+        if (!pObj) continue;
 
-    FORMATETC fmt = {static_cast<CLIPFORMAT>(cf), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM stg = {};
-    bool ok = false;
-    if (SUCCEEDED(pObj->GetData(&fmt, &stg)) && stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
-        size_t sz = GlobalSize(stg.hGlobal);
-        const uint8_t* ptr = static_cast<const uint8_t*>(GlobalLock(stg.hGlobal));
-        if (ptr && sz > 0) {
-            outBytes.assign(ptr, ptr + sz);
-            ok = true;
-            GlobalUnlock(stg.hGlobal);
+        FORMATETC fmt = {static_cast<CLIPFORMAT>(cf), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM stg = {};
+        bool ok = false;
+        if (SUCCEEDED(pObj->GetData(&fmt, &stg)) && stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
+            size_t sz = GlobalSize(stg.hGlobal);
+            const uint8_t* ptr = static_cast<const uint8_t*>(GlobalLock(stg.hGlobal));
+            if (ptr && sz > 0) {
+                outBytes.assign(ptr, ptr + sz);
+                ok = true;
+                GlobalUnlock(stg.hGlobal);
+            }
+            ReleaseStgMedium(&stg);
         }
-        ReleaseStgMedium(&stg);
+        pObj->Release();
+        if (ok) return true;
+        Sleep(20);
     }
-    pObj->Release();
-    return ok;
+    return false;
 }
 
 void SetSimulatedObserverViaApi(uint16_t daemonPort, bool enabled,
@@ -371,8 +427,8 @@ int main(int argc, char* argv[]) {
   ]
 })";
 
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"" + sclip::JsonEscape(complexJson) + "\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"" + sclip::JsonEscape(complexJson) + "\"}");
     DWORD seqAfterSingleArm = GetClipboardSequenceNumber();
 
     // 2.1 TypeScript (.ts) context
@@ -446,12 +502,12 @@ int main(int argc, char* argv[]) {
     // Check .xlsx virtual stream on the exact same JSON seed!
     SetSimulatedObserverViaApi(kDaemonPort, true, "explorer.exe", "Documents");
     {
-        IDataObject* pObj = nullptr;
-        VERIFY_ASSERT(SUCCEEDED(OleGetClipboard(&pObj)) && pObj != nullptr, "Opened OLE clipboard for .xlsx check");
+        IDataObject* pObj = AcquireComClipboard();
+        VERIFY_ASSERT(pObj != nullptr, "Opened OLE clipboard for .xlsx check");
         if (pObj) {
             FORMATETC fmtFc = {static_cast<CLIPFORMAT>(rf.cfFileContents), nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM};
             STGMEDIUM stgFc = {};
-            VERIFY_ASSERT(SUCCEEDED(pObj->GetData(&fmtFc, &stgFc)) && stgFc.tymed == TYMED_ISTREAM && stgFc.pstm != nullptr,
+            VERIFY_ASSERT(SUCCEEDED(GetDataWithRetry(pObj, &fmtFc, &stgFc)) && stgFc.tymed == TYMED_ISTREAM && stgFc.pstm != nullptr,
                           "[Collapse 7/7 Explorer .xlsx] Obtained TYMED_ISTREAM for styled .xlsx virtual file");
             if (stgFc.pstm) {
                 uint8_t zipSig[4] = {};
@@ -478,8 +534,12 @@ int main(int argc, char* argv[]) {
         "<rect x=\"10\" y=\"10\" width=\"280\" height=\"180\" rx=\"20\" fill=\"#0F172A\" stroke=\"#38BDF8\" stroke-width=\"4\"/>"
         "<circle cx=\"150\" cy=\"100\" r=\"55\" fill=\"#3B82F6\"/>"
         "</svg>";
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"" + sclip::JsonEscape(sampleSvg) + "\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"" + sclip::JsonEscape(sampleSvg) + "\"}");
+    // Per the collapse matrix, raster image synthesis is the correct eigenstate for
+    // chat / canvas / slide observers. Pin that context so the assertion is deterministic
+    // even while an Explorer window happens to own the foreground.
+    SetSimulatedObserverViaApi(kDaemonPort, true, "WeChat.exe", "WeChat");
 
     std::vector<uint8_t> pngBytes, dibV5Bytes, dibBytes;
     VERIFY_ASSERT(ReadComClipboardBytes(rf.cfPng, pngBytes) && pngBytes.size() > 256,
@@ -508,26 +568,29 @@ int main(int argc, char* argv[]) {
                   "Synthesized valid CF_DIB bitmap payload");
 
     // Also test Code Card PNG + #HEX Swatch Card PNG
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"pub async fn collapse_wavefunction(seed: &Seed) -> Result<Payload> {\\n    Ok(seed.synthesize())\\n}\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"pub async fn collapse_wavefunction(seed: &Seed) -> Result<Payload> {\\n    Ok(seed.synthesize())\\n}\"}");
     std::vector<uint8_t> codePng;
     VERIFY_ASSERT(ReadComClipboardBytes(rf.cfPng, codePng) && codePng.size() > 1024 &&
                   std::memcmp(codePng.data(), kPngMagic, 8) == 0,
                   "Synthesized 2x HiDPI anti-aliased Syntax Code Card PNG");
 
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm", "{\"text\":\"#3B82F6\"}");
+    ArmSeedViaApi(kDaemonPort, "{\"text\":\"#3B82F6\"}");
     std::vector<uint8_t> swatchPng;
     VERIFY_ASSERT(ReadComClipboardBytes(rf.cfPng, swatchPng) && swatchPng.size() > 1024 &&
                   std::memcmp(swatchPng.data(), kPngMagic, 8) == 0,
                   "Synthesized 2x HiDPI #3B82F6 Designer Color Swatch PNG");
+    SetSimulatedObserverViaApi(kDaemonPort, false);
 
     // ========================================================================
     // VERIFICATION 4: CFSTR_FILECONTENTS + IStream True 24 MB Streaming Disk Write
     // ========================================================================
     std::printf("\n--- [Verification 4] CFSTR_FILECONTENTS + TYMED_ISTREAM 24 MB Streaming & SHA-256 ---\n");
     fileServer.ResetCounters();
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"" + sclip::JsonEscape(testFileUrl) + "\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"" + sclip::JsonEscape(testFileUrl) + "\"}");
+    // Virtual file streams are the Explorer eigenstate; pin it for a deterministic assertion.
+    SetSimulatedObserverViaApi(kDaemonPort, true, "explorer.exe", "Downloads");
 
     SIZE_T memBeforeStream = GetProcessWorkingSetBytes(pi.hProcess);
     SIZE_T peakMemDeltaBytes = 0;
@@ -535,15 +598,15 @@ int main(int argc, char* argv[]) {
     std::wstring outFilePath = L"bin\\e2e_streamed_24mb_output.bin";
     DeleteFileW(outFilePath.c_str());
 
-    IDataObject* pStreamDataObj = nullptr;
-    VERIFY_ASSERT(SUCCEEDED(OleGetClipboard(&pStreamDataObj)) && pStreamDataObj != nullptr,
+    IDataObject* pStreamDataObj = AcquireComClipboard();
+    VERIFY_ASSERT(pStreamDataObj != nullptr,
                   "Acquired real COM IDataObject from OS clipboard for 24 MB stream");
 
     if (pStreamDataObj) {
         // 4.1 Read CFSTR_FILEDESCRIPTORW
         FORMATETC fmtDesc = {static_cast<CLIPFORMAT>(rf.cfFileDescriptorW), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
         STGMEDIUM stgDesc = {};
-        HRESULT hrDesc = pStreamDataObj->GetData(&fmtDesc, &stgDesc);
+        HRESULT hrDesc = GetDataWithRetry(pStreamDataObj, &fmtDesc, &stgDesc);
         VERIFY_ASSERT(SUCCEEDED(hrDesc) && stgDesc.tymed == TYMED_HGLOBAL && stgDesc.hGlobal != nullptr,
                       "Retrieved CFSTR_FILEDESCRIPTORW metadata via COM GetData");
 
@@ -572,7 +635,7 @@ int main(int argc, char* argv[]) {
         // 4.2 Read CFSTR_FILECONTENTS (lindex = 0, TYMED_ISTREAM)
         FORMATETC fmtStream = {static_cast<CLIPFORMAT>(rf.cfFileContents), nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM};
         STGMEDIUM stgStream = {};
-        HRESULT hrStm = pStreamDataObj->GetData(&fmtStream, &stgStream);
+        HRESULT hrStm = GetDataWithRetry(pStreamDataObj, &fmtStream, &stgStream);
         VERIFY_ASSERT(SUCCEEDED(hrStm) && stgStream.tymed == TYMED_ISTREAM && stgStream.pstm != nullptr,
                       "Acquired live COM IStream* (TYMED_ISTREAM) for CFSTR_FILECONTENTS");
 
@@ -635,6 +698,7 @@ int main(int argc, char* argv[]) {
     VERIFY_ASSERT(!diskSha256.empty() && diskSha256 == expectedSha256,
                   "Streamed 24 MB file SHA-256 matches source 100% byte-for-byte!");
     DeleteFileW(outFilePath.c_str());
+    SetSimulatedObserverViaApi(kDaemonPort, false);
 
     // ========================================================================
     // VERIFICATION 5: cURL, URL Git/Markdown, Local Image Base64, Bypass & Clean Exit
@@ -645,8 +709,8 @@ int main(int argc, char* argv[]) {
     const std::string curlSample =
         "curl 'https://api.example.com/v1/items' -H 'Authorization: Bearer tok_123' "
         "-H 'Cookie: sid=abc' --data-raw '{\"name\":\"qubit\",\"count\":8}'";
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"" + sclip::JsonEscape(curlSample) + "\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"" + sclip::JsonEscape(curlSample) + "\"}");
 
     SetSimulatedObserverViaApi(kDaemonPort, true, "Code.exe", "client.py - Visual Studio Code");
     std::string curlPy;
@@ -664,8 +728,8 @@ int main(int argc, char* argv[]) {
                   "cURL collapsed to modern async fetch() for .ts/.js editor");
 
     // 5.2 GitHub Repo URL -> git clone in Terminal & Smart Link in .md
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"text\":\"https://github.com/CEXpp/schrodinger-clip\"}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"text\":\"https://github.com/CEXpp/schrodinger-clip\"}");
     SetSimulatedObserverViaApi(kDaemonPort, true, "WindowsTerminal.exe", "PowerShell");
     std::string ghTerm;
     VERIFY_ASSERT(ReadComClipboardUnicodeText(ghTerm) &&
@@ -688,8 +752,8 @@ int main(int argc, char* argv[]) {
     }
     wchar_t fullPngPath[MAX_PATH] = {};
     GetFullPathNameW(tempPngPath.c_str(), MAX_PATH, fullPngPath, nullptr);
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm",
-                     "{\"filePaths\":[\"" + sclip::JsonEscape(sclip::WideToUtf8(fullPngPath)) + "\"]}");
+    ArmSeedViaApi(kDaemonPort,
+                  "{\"filePaths\":[\"" + sclip::JsonEscape(sclip::WideToUtf8(fullPngPath)) + "\"]}");
 
     SetSimulatedObserverViaApi(kDaemonPort, true, "Code.exe", "index.html - Visual Studio Code");
     std::string inlineUri;
@@ -699,11 +763,13 @@ int main(int argc, char* argv[]) {
     DeleteFileW(tempPngPath.c_str());
 
     // 5.4 Raw Bypass Mode Toggle Verification
-    HttpRequestLocal(kDaemonPort, L"POST", L"/api/arm", "{\"text\":\"{\\\"rawKey\\\":123}\"}");
+    ArmSeedViaApi(kDaemonPort, "{\"text\":\"{\\\"rawKey\\\":123}\"}");
     HttpRequestLocal(kDaemonPort, L"POST", L"/api/lock", "{\"mode\":1}"); // RawBypass ON
     SetSimulatedObserverViaApi(kDaemonPort, true, "Code.exe", "schema.ts - Visual Studio Code");
     std::string bypassedOut;
-    VERIFY_ASSERT(ReadComClipboardUnicodeText(bypassedOut) && bypassedOut == "{\"rawKey\":123}",
+    bool bypassReadOk = ReadComClipboardUnicodeText(bypassedOut);
+    std::printf("  -> Raw bypass payload: ok=%d [%s]\n", bypassReadOk ? 1 : 0, bypassedOut.c_str());
+    VERIFY_ASSERT(bypassReadOk && bypassedOut == "{\"rawKey\":123}",
                   "Raw Bypass Mode ON delivered exact unmodified JSON into .ts editor");
     HttpRequestLocal(kDaemonPort, L"POST", L"/api/lock", "{\"mode\":0}"); // Auto mode restored
     std::string restoredTsOut;

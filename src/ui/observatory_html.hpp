@@ -242,6 +242,7 @@ inline std::string GetObservatoryHtmlPage() {
         <button class="preset-btn" onclick="armSample('stream24m')">📦 武装 24MB 远程直链 (可去资源管理器 Ctrl+V!)</button>
         <button class="preset-btn" onclick="armSample('hex')">🌈 武装 #3B82F6 色值</button>
         <button class="preset-btn" onclick="armSample('mermaid')">📊 武装 Mermaid 架构图</button>
+        <button class="preset-btn" onclick="armSample('math')">🧮 武装薛定谔波动方程 LaTeX</button>
       </div>
       <div class="sim-bar">
         <span style="font-size:12px;color:var(--txt-dim);">模拟观测宿主语境:</span>
@@ -253,6 +254,7 @@ inline std::string GetObservatoryHtmlPage() {
           <option value="datagrip64.exe|migration.sql - DataGrip|text">DataGrip [migration.sql] (.sql)</option>
           <option value="EXCEL.EXE|Book1 - Excel|html">EXCEL.EXE [CF_HTML 多列表格]</option>
           <option value="WeChat.exe|技术架构群|png">WeChat.exe [2x HiDPI PNG 图像卡片]</option>
+          <option value="explorer.exe|Documents|istream">explorer.exe [CFSTR_FILECONTENTS 虚拟文件流]</option>
           <option value="WindowsTerminal.exe|PowerShell 7|text">WindowsTerminal.exe [Shell 命令]</option>
           <option value="Typora.exe|notes.md - Typora|text">Typora.exe [notes.md] (.md)</option>
         </select>
@@ -317,7 +319,8 @@ const SAMPLES = {
   Seed[Ctrl+C Raw Seed] --> OLE[COM IDataObject]
   OLE -->|0 Bytes RAM| Shield{Sniffer Shield}
   Shield -->|Ctrl+V Paste| Obs[Observer Detector]
-  Obs --> Stream[TYMED_ISTREAM / AST / 2x PNG]`
+  Obs --> Stream[TYMED_ISTREAM / AST / 2x PNG]`,
+  math: String.raw`$$i\hbar \frac{\partial \Psi}{\partial t} = -\frac{\hbar^2}{2m}\nabla^2 \Psi + V(x)\Psi$$`
 };
 
 let appState = {
@@ -379,6 +382,8 @@ async function pollState() {
     document.getElementById('seedKindBadge').textContent = data.seed.badgeZh + ' // ' + data.seed.kindName;
     if (data.seed.hasSeed) {
       document.getElementById('seedPreview').textContent = data.seed.rawPreview || '(Empty Seed)';
+    } else {
+      document.getElementById('seedPreview').textContent = '(在任意软件按下 Ctrl+C，或点击下方演练场一键武装量子种子)';
     }
 
     if (data.stats.latestEventId > appState.lastEventId && data.events.length > 0) {
