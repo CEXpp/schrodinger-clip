@@ -1,0 +1,19 @@
+name: Windows Native COM Build & Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build & Run Adversarial Edge-Case + E2E Suites
+        shell: pwsh
+        run: |
+          .\verify_e2e.ps1
