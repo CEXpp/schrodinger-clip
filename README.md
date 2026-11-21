@@ -2,10 +2,11 @@
 
 > **基于操作系统原生 OLE/COM 延迟求值协议 (`OleSetClipboard` + `IDataObject` + `TYMED_ISTREAM`) 与双层目标观测者实时感知的多态流式剪贴板引擎**
 
+[![CI](https://github.com/CEXpp/schrodinger-clip/actions/workflows/ci.yml/badge.svg)](https://github.com/CEXpp/schrodinger-clip/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?logo=windows)](https://microsoft.com)
 [![Core](https://img.shields.io/badge/Core-Native%20C%2B%2B17%20Win32%20COM%20VTable-38BDF8)](./src)
 [![Evaluated_At_Copy](https://img.shields.io/badge/Copy%20Time%20Memory-0%20Bytes%20Evaluated-10B981)](#一五大系统底层架构铁律)
-[![Verification](https://img.shields.io/badge/E2E%20%2B%20Edge%20Tests-99%2F99%20Passed%20(SHA--256%20Verified)-A855F7)](#四自动化端到端实测验收报告)
+[![Verification](https://img.shields.io/badge/E2E%20%2B%20Edge%20Tests-105%2F105%20Passed%20(SHA--256%20Verified)-A855F7)](#四自动化端到端实测验收报告)
 [![License](https://img.shields.io/badge/License-MIT-F59E0B)](./LICENSE)
 
 ---
@@ -126,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File .\verify_e2e.ps1
 | 验收阶段 | 实测内容与硬指标 | 实测结果 |
 | :--- | :--- | :--- |
 | **编译质量门禁** | `g++ -std=c++17 -O2 -Wall -Wextra -Werror` 编译全部 3 个目标 | **0 Warnings / 0 Errors** |
-| **边界与对抗单测 (`edge_cases_test`)** | 空输入、截断损坏 JSON 回退、保留字转义、UTF-16 代理对、CMD `^` 多行 cURL、`IStream` 越界 Seek / 断网 `STG_E_READFAULT`、嗅探黑名单 | **47 / 47 断言全部通过** |
+| **边界与对抗单测 (`edge_cases_test`)** | 空输入、截断损坏 JSON 回退、保留字转义、UTF-16 代理对、CMD `^` 多行 cURL、`QueryGetData` 零网络探测、终端流门禁、`IStream` 越界 Seek / 断网 `STG_E_READFAULT`、LaTeX 公式与 SVG 椭圆弧渲染、嗅探黑名单 | **53 / 53 断言全部通过** |
 | **验证 1：严格延迟求值与零预下载** | 挂载 24 MB (`25,165,824 Bytes`) 测试文件 HTTP 服务器，写入真实系统剪贴板并校验免监控护盾后等待 `650 ms` | 服务器收到 **`0 GET`、`0 HEAD`、`0 Bytes` 下载** |
 | **验证 2：单次复制、7 语境非破坏性坍缩** | 同一复杂嵌套 JSON 在不重新复制前提下（序列号恒定），连续经真实 COM 读取 `.ts`、`.py`、`.sql`、Excel (`CF_HTML`+`CSV`+`TSV`)、`.go`、`.rs`、Explorer `.xlsx` 流 | **7 次异构坍缩全部精准合法，剪贴板序列号 0 变化** |
 | **验证 3：视觉即时光栅化合成** | 注入 SVG 矢量源码、代码片段与 `#3B82F6` 色值，经 COM 请求 `PNG` / `CF_DIBV5` / `CF_DIB` | 精确合成 `2x` HiDPI 图像（300×200 SVG ──▶ **600×400 32bpp PNG/DIBV5**） |
@@ -160,13 +161,19 @@ schrodinger-clip/
 │       └── observatory_html.hpp        # 赛博实验室风「波函数坍缩观测台」前端控制台
 ├── tests/
 │   ├── e2e_verify.cpp                  # 直连真实 OS 剪贴板与 COM IDataObject/IStream 的 52 项端到端验收套件
-│   └── edge_cases_test.cpp             # 47 项对抗性边界、异常流、错误码与保留字单元测试套件
+│   └── edge_cases_test.cpp             # 53 项对抗性边界、零网络 QueryGetData、异常流与图形渲染单元测试套件
 ├── build.ps1                           # 一键零警告编译脚本
 ├── run_observatory.ps1                 # 一键启动守护进程与观测台界面
 └── verify_e2e.ps1                      # 一键全量编译与自动化验收脚本
 ```
 
 ---
+
+## 贡献、发布与维护
+
+- **预编译二进制下载**：每次推送至 `main` 的 [GitHub Actions CI](https://github.com/CEXpp/schrodinger-clip/actions/workflows/ci.yml) 会自动编译并运行全部 105 项验收断言，通过后上传已验证的 `schrodinger-clip-win64` 制品；正式版本可在 [GitHub Releases](https://github.com/CEXpp/schrodinger-clip/releases) 下载附带 `SHA256SUMS.txt` 校验的压缩包。
+- **更新日志**：详见 [CHANGELOG.md](./CHANGELOG.md)。
+- **参与贡献**：欢迎阅读 [CONTRIBUTING.md](./CONTRIBUTING.md) 并通过 Issue / PR 提交新的叠加态种子分类器、目标宿主微语境或坍缩转译器。
 
 ## License
 

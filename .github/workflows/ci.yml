@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-and-verify:
@@ -13,7 +14,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Show toolchain version
+        shell: pwsh
+        run: g++ --version
+
       - name: Build & Run Adversarial Edge-Case + E2E Suites
         shell: pwsh
         run: |
           .\verify_e2e.ps1
+
+      - name: Upload verified Windows x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: schrodinger-clip-win64
+          path: |
+            bin/schrodinger_clip.exe
+            run_observatory.ps1
+            README.md
+            LICENSE
+          retention-days: 14

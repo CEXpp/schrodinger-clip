@@ -64,8 +64,8 @@ int main() {
         // Verify SuperpositionDataObject falls back to raw text instead of crashing on malformed JSON
         sclip::ObserverContextManager obsMgr;
         obsMgr.SetSimulatedObserver(true, "Code.exe", "broken.ts - VS Code");
-        sclip::TelemetryHub hub;
-        auto* dobj = new sclip::SuperpositionDataObject(badJsonSeed, &obsMgr, &hub);
+        auto hub = std::make_shared<sclip::TelemetryHub>();
+        auto* dobj = new sclip::SuperpositionDataObject(badJsonSeed, &obsMgr, hub);
         FORMATETC fmt = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
         STGMEDIUM stg = {};
         EDGE_ASSERT(SUCCEEDED(dobj->GetData(&fmt, &stg)), "Malformed JSON gracefully falls back in GetData");
@@ -146,8 +146,10 @@ int main() {
     {
         auto urlSeed = sclip::ClassifyTextSeed("http://127.0.0.1:59999/unreachable_file.bin", 6);
         sclip::ObserverContextManager obsMgr;
-        sclip::TelemetryHub hub;
-        auto* dobj = new sclip::SuperpositionDataObject(urlSeed, &obsMgr, &hub);
+        // Pin File Explorer deterministically so headless CI terminals (pwsh.exe) never mask COM contract checks
+        obsMgr.SetSimulatedObserver(true, "explorer.exe", "Downloads");
+        auto hub = std::make_shared<sclip::TelemetryHub>();
+        auto* dobj = new sclip::SuperpositionDataObject(urlSeed, &obsMgr, hub);
 
         EDGE_ASSERT(dobj->GetData(nullptr, nullptr) == E_INVALIDARG, "GetData(nullptr) -> E_INVALIDARG");
 
@@ -160,13 +162,31 @@ int main() {
 
         const auto& rf = sclip::RegisteredFormats::Instance();
         FORMATETC goodLindexFc = {static_cast<CLIPFORMAT>(rf.cfFileContents), nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM};
-        EDGE_ASSERT(dobj->QueryGetData(&goodLindexFc) == S_OK, "lindex=0 on CFSTR_FILECONTENTS -> S_OK");
+        EDGE_ASSERT(dobj->QueryGetData(&goodLindexFc) == S_OK, "lindex=0 on CFSTR_FILECONTENTS (Explorer) -> S_OK");
 
         FORMATETC badLindexFc = {static_cast<CLIPFORMAT>(rf.cfFileContents), nullptr, DVASPECT_CONTENT, 5, TYMED_ISTREAM};
         EDGE_ASSERT(dobj->QueryGetData(&badLindexFc) == DV_E_LINDEX, "lindex=5 on CFSTR_FILECONTENTS -> DV_E_LINDEX");
 
-        // Test unreachable HTTP stream fails gracefully with STG_E_READFAULT (no crash/leak)
-        if (SUCCEEDED(dobj->GetData(&goodLindexFc, &stg)) && stg.pstm) {
+        // Verify observer gate blocks virtual file stream in Terminal hosts (pwsh.exe)
+        obsMgr.SetSimulatedObserver(true, "pwsh.exe", "PowerShell");
+        EDGE_ASSERT(dobj->QueryGetData(&goodLindexFc) == DV_E_FORMATETC,
+                    "CFSTR_FILECONTENTS gated off for Terminal host (pwsh.exe)");
+
+        // Verify QueryGetData NEVER performs a blocking network HEAD probe on binary URLs
+        obsMgr.SetSimulatedObserver(true, "WeChat.exe", "Chat");
+        FORMATETC pngFmt = {static_cast<CLIPFORMAT>(rf.cfPng), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        auto tProbeStart = std::chrono::steady_clock::now();
+        HRESULT hrPngQuery = dobj->QueryGetData(&pngFmt);
+        double probeMs = sclip::ElapsedMs(tProbeStart);
+        EDGE_ASSERT(hrPngQuery == DV_E_FORMATETC && probeMs < 200.0,
+                    "QueryGetData(PNG) rejects .bin URL immediately with zero network I/O");
+
+        // Restore Explorer observer to verify unreachable HTTP stream returns STG_E_READFAULT cleanly
+        obsMgr.SetSimulatedObserver(true, "explorer.exe", "Downloads");
+        HRESULT hrStreamGet = dobj->GetData(&goodLindexFc, &stg);
+        EDGE_ASSERT(SUCCEEDED(hrStreamGet) && stg.pstm != nullptr,
+                    "GetData(CFSTR_FILECONTENTS) returns live IStream under Explorer observer");
+        if (SUCCEEDED(hrStreamGet) && stg.pstm) {
             uint8_t buf[64];
             ULONG got = 99;
             EDGE_ASSERT(stg.pstm->Read(nullptr, 64, &got) == STG_E_INVALIDPOINTER, "Read(nullptr) -> STG_E_INVALIDPOINTER");
@@ -226,6 +246,23 @@ int main() {
         auto mBundle = sclip::RenderMermaidBitmap2x(mermaidCode);
         EDGE_ASSERT(mBundle.valid && mBundle.width >= 720 && mBundle.height >= 420,
                     "Mermaid diagram rendered to valid 2x HiDPI PNG & DIB");
+
+        const std::string latexCode = "$$i\\hbar \\frac{\\partial \\Psi}{\\partial t} = -\\frac{\\hbar^2}{2m}\\nabla^2 \\Psi + V(x)\\Psi$$";
+        auto latexSeed = sclip::ClassifyTextSeed(latexCode, 7);
+        EDGE_ASSERT(latexSeed.kind == sclip::SuperpositionKind::VisualSource &&
+                    latexSeed.visualSyntax == sclip::VisualSyntax::MathLatex,
+                    "Schrodinger equation LaTeX classified as MathLatex visual source");
+        auto mathBundle = sclip::RenderMathFormulaBitmap2x(latexCode);
+        EDGE_ASSERT(mathBundle.valid && mathBundle.width >= 780 && !mathBundle.pngBytes.empty(),
+                    "LaTeX formula rendered to valid 2x HiDPI PNG & DIB");
+
+        const std::string arcSvg =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 200\" width=\"200\" height=\"200\">"
+            "<path d=\"M 20 100 A 80 50 0 1 1 180 100 Z\" fill=\"#38BDF8\" stroke=\"#A855F7\" stroke-width=\"3\"/>"
+            "</svg>";
+        auto arcBundle = sclip::RenderSvgBitmap2x(arcSvg);
+        EDGE_ASSERT(arcBundle.valid && arcBundle.width == 512 && arcBundle.height == 512 && arcBundle.pngBytes.size() > 512,
+                    "SVG elliptical arc (A command) rasterized accurately at HiDPI >= 512px");
 
         auto shortHex = sclip::ParseHexColorDetails("#0AF");
         EDGE_ASSERT(shortHex.normalizedHex == "#00AAFF", "3-digit #0AF expanded to #00AAFF");

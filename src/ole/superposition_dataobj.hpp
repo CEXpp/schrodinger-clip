@@ -177,11 +177,11 @@ class SuperpositionDataObject final : public IDataObject {
 public:
     SuperpositionDataObject(QuantumSeed seed,
                             ObserverContextManager* observerMgr,
-                            TelemetryHub* telemetry)
+                            std::shared_ptr<TelemetryHub> telemetry)
         : refCount_(1),
           seed_(std::move(seed)),
           observerMgr_(observerMgr),
-          telemetry_(telemetry) {
+          telemetry_(std::move(telemetry)) {
         GetSystemTimeAsFileTime(&armedFileTime_);
         BuildAdvertisedFormatList();
     }
@@ -278,8 +278,8 @@ public:
             return DV_E_FORMATETC;
         }
 
-        // Unified Observer + Lock-Mode Format Gate
-        if (!IsFormatAllowedForObserver(cf, obs)) {
+        // Unified Observer + Lock-Mode Format Gate (allow paste-time HEAD probe only inside GetData)
+        if (!IsFormatAllowedForObserver(cf, obs, true)) {
             return DV_E_FORMATETC;
         }
 
@@ -377,7 +377,8 @@ public:
 
         if (observerMgr_) {
             ObserverSnapshot obs = observerMgr_->Capture(true);
-            if (!IsFormatAllowedForObserver(cf, obs)) {
+            // QueryGetData must remain strictly zero-network / sub-millisecond!
+            if (!IsFormatAllowedForObserver(cf, obs, false)) {
                 return DV_E_FORMATETC;
             }
         }
@@ -442,7 +443,7 @@ private:
     std::atomic<ULONG> refCount_;
     QuantumSeed seed_;
     ObserverContextManager* observerMgr_ = nullptr;
-    TelemetryHub* telemetry_ = nullptr;
+    std::shared_ptr<TelemetryHub> telemetry_;
     FILETIME armedFileTime_ = {};
     std::vector<FORMATETC> formats_;
 
@@ -471,10 +472,37 @@ private:
         return cachedUrlHead_;
     }
 
-    // Strictly paste-time check: static image suffix OR HTTP HEAD Content-Type: image/*
-    bool IsRemoteUrlImageAtPasteTime() {
+    static bool HasObviousNonImageExtension(const std::string& rawUrl) {
+        std::string path = rawUrl;
+        size_t q = path.find_first_of("?#");
+        if (q != std::string::npos) path = path.substr(0, q);
+        size_t slash = path.rfind('/');
+        std::string base = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+        size_t dot = base.rfind('.');
+        if (dot == std::string::npos || dot + 1 >= base.size()) return false;
+        std::string ext = ToLowerAscii(base.substr(dot));
+        static const std::set<std::string> kNonImageExts = {
+            ".bin", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".xz", ".bz2",
+            ".exe", ".msi", ".dll", ".iso", ".img", ".dmg", ".deb", ".rpm",
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+            ".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".flac",
+            ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".txt", ".md", ".log", ".sql"
+        };
+        return kNonImageExts.count(ext) > 0;
+    }
+
+    // Strictly paste-time check: static image suffix OR (when allowed) HTTP HEAD Content-Type: image/*
+    bool IsRemoteUrlImageAtPasteTime(bool allowNetworkProbe) {
         if (seed_.kind != SuperpositionKind::RemoteUrl || seed_.isGitHubRepoUrl) return false;
         if (seed_.looksLikeImageUrl) return true;
+        if (HasObviousNonImageExtension(seed_.rawText)) return false;
+        {
+            std::lock_guard<std::mutex> lk(lazyCacheMu_);
+            if (hasProbedUrlHead_) {
+                return StartsWithIgnoreCase(cachedUrlHead_.contentType, "image/");
+            }
+        }
+        if (!allowNetworkProbe) return false;
         UrlHeadMetadata head = EnsureUrlHeadProbed();
         return StartsWithIgnoreCase(head.contentType, "image/");
     }
@@ -487,19 +515,19 @@ private:
                seed_.kind == SuperpositionKind::HexColor;
     }
 
-    bool SupportsAutoVisualImageCollapse() {
+    bool SupportsAutoVisualImageCollapse(bool allowNetworkProbe) {
         if (seed_.kind == SuperpositionKind::VisualSource ||
             seed_.kind == SuperpositionKind::HexColor ||
             seed_.kind == SuperpositionKind::CurlCommand) {
             return true;
         }
         if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl) {
-            return IsRemoteUrlImageAtPasteTime();
+            return IsRemoteUrlImageAtPasteTime(allowNetworkProbe);
         }
         return false;
     }
 
-    bool IsFormatAllowedForObserver(UINT cf, const ObserverSnapshot& obs) {
+    bool IsFormatAllowedForObserver(UINT cf, const ObserverSnapshot& obs, bool allowNetworkProbe) {
         const auto& rf = RegisteredFormats::Instance();
         if (obs.isBlockedSniffer) return false;
 
@@ -547,7 +575,14 @@ private:
             if (obs.category != HostCategory::VisualCanvasOrChat && obs.category != HostCategory::PlainGeneric) {
                 return false;
             }
-            return SupportsAutoVisualImageCollapse();
+            // In QueryGetData (allowNetworkProbe == false) for extensionless URLs in a chat/canvas host,
+            // tentatively advertise image availability so the host calls GetData(PNG) where HEAD is probed lazily.
+            if (!allowNetworkProbe && seed_.kind == SuperpositionKind::RemoteUrl &&
+                !seed_.isGitHubRepoUrl && obs.category == HostCategory::VisualCanvasOrChat &&
+                !HasObviousNonImageExtension(seed_.rawText)) {
+                return true;
+            }
+            return SupportsAutoVisualImageCollapse(allowNetworkProbe);
         }
 
         if (cf == rf.cfHtml) {
@@ -569,7 +604,7 @@ private:
         }
 
         if (cf == CF_UNICODETEXT || cf == CF_TEXT) {
-            if (obs.category == HostCategory::VisualCanvasOrChat && SupportsAutoVisualImageCollapse()) {
+            if (obs.category == HostCategory::VisualCanvasOrChat && SupportsAutoVisualImageCollapse(allowNetworkProbe)) {
                 return false;
             }
             return true;
@@ -874,7 +909,7 @@ private:
             outDesc = "cURL -> 2x API Request Card PNG";
             return RenderCodeCardBitmap2x(seed_.rawText, "NETWORK CURL // 2X HIDPI");
         }
-        if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl && IsRemoteUrlImageAtPasteTime()) {
+        if (seed_.kind == SuperpositionKind::RemoteUrl && !seed_.isGitHubRepoUrl && IsRemoteUrlImageAtPasteTime(true)) {
             outDesc = "Remote Image URL -> Lazy Decoded Bitmap";
             std::vector<uint8_t> rawImg;
             if (FetchRemoteImageBytesOnDemand(seed_.rawText, rawImg)) {
@@ -1083,16 +1118,16 @@ private:
                 uint64_t evId = RecordCollapse(
                     obs, cf, "istream_file", spec.transformerDesc, ElapsedMs(tStart), 0, 0,
                     "[Streaming Active] Pumping " + WideToUtf8(spec.fileName) + " via 64KB~256KB WinHTTP IStream...");
-                TelemetryHub* hubPtr = telemetry_;
+                std::weak_ptr<TelemetryHub> weakHub = telemetry_;
                 pmedium->pstm = new HttpChunkedStream(
                     seed_.rawText,
                     spec.fileName,
                     spec.hasKnownSize,
                     spec.fileSize,
                     armedFileTime_,
-                    [hubPtr, evId](uint64_t bytesStreamed, double totalMs) {
-                        if (hubPtr && evId != 0) {
-                            hubPtr->UpdateStreamCompletion(evId, bytesStreamed, totalMs);
+                    [weakHub, evId](uint64_t bytesStreamed, double totalMs) {
+                        if (auto hub = weakHub.lock(); hub && evId != 0) {
+                            hub->UpdateStreamCompletion(evId, bytesStreamed, totalMs);
                         }
                     });
                 return S_OK;

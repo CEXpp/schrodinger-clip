@@ -690,7 +690,7 @@ inline RenderedImageBundle RenderMathFormulaBitmap2x(const std::string& rawLatex
 
         Gdiplus::Font hdrFont(L"Consolas", 17.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
         Gdiplus::SolidBrush hdrBr(Gdiplus::Color(225, 192, 132, 252));
-        g.DrawString(L"\xCE\xA8 QUANTUM EQUATION TYPESETTER // 2X HIDPI", -1, &hdrFont,
+        g.DrawString(L"\u03A8 QUANTUM EQUATION TYPESETTER // 2X HIDPI", -1, &hdrFont,
                      Gdiplus::PointF(margin + 34.0f, margin + 24.0f), &hdrBr);
 
         float centerY = margin + (hasAnyFrac ? 148.0f : 126.0f);

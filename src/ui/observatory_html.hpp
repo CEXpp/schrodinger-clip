@@ -182,7 +182,9 @@ inline std::string GetObservatoryHtmlPage() {
       <option value="7">🔒 锁定 Excel 多列表格 (Grid)</option>
       <option value="8">🔒 锁定 Markdown 语境 (.md)</option>
       <option value="9">🔒 锁定 2x 抗锯齿视觉卡片 (PNG)</option>
+      <option value="10">🔒 锁定 JS/TS Async fetch()</option>
     </select>
+    <button onclick="disarmSeed()" title="释放当前 OLE 叠加态句柄">🧹 清空叠加态</button>
   </div>
 </header>
 
@@ -243,6 +245,7 @@ inline std::string GetObservatoryHtmlPage() {
         <button class="preset-btn" onclick="armSample('hex')">🌈 武装 #3B82F6 色值</button>
         <button class="preset-btn" onclick="armSample('mermaid')">📊 武装 Mermaid 架构图</button>
         <button class="preset-btn" onclick="armSample('math')">🧮 武装薛定谔波动方程 LaTeX</button>
+        <button class="preset-btn" onclick="armSample('epoch')">⏰ 武装 Unix 毫秒时间戳</button>
       </div>
       <div class="sim-bar">
         <span style="font-size:12px;color:var(--txt-dim);">模拟观测宿主语境:</span>
@@ -320,7 +323,8 @@ const SAMPLES = {
   OLE -->|0 Bytes RAM| Shield{Sniffer Shield}
   Shield -->|Ctrl+V Paste| Obs[Observer Detector]
   Obs --> Stream[TYMED_ISTREAM / AST / 2x PNG]`,
-  math: String.raw`$$i\hbar \frac{\partial \Psi}{\partial t} = -\frac{\hbar^2}{2m}\nabla^2 \Psi + V(x)\Psi$$`
+  math: String.raw`$$i\hbar \frac{\partial \Psi}{\partial t} = -\frac{\hbar^2}{2m}\nabla^2 \Psi + V(x)\Psi$$`,
+  epoch: "1731912000000"
 };
 
 let appState = {
@@ -435,6 +439,11 @@ async function armSample(key) {
   await pollState();
 }
 
+async function disarmSeed() {
+  await fetch('/api/disarm', { method: 'POST' });
+  await pollState();
+}
+
 async function toggleBypass() {
   await fetch('/api/lock', {
     method: 'POST',
@@ -490,8 +499,8 @@ function drawStarGraph() {
   for (let i = 0; i < count; i++) {
     const o = orbits[i] || { label: 'Eigenstate', armed: false };
     const ring = (i % 3);
-    const rx = 145 + ring * 82;
-    const ry = 76 + ring * 48;
+    const rx = 112 + ring * 62;
+    const ry = 66 + ring * 44;
     const baseAngle = (i / count) * Math.PI * 2 + angleTick * (ring % 2 === 0 ? 1 : -0.8);
 
     ctx.save();

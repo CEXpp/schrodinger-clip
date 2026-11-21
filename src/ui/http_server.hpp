@@ -34,11 +34,11 @@ public:
     ObservatoryHttpServer(uint16_t port,
                           HWND staHwnd,
                           ObserverContextManager* obsMgr,
-                          TelemetryHub* telemetry)
+                          std::shared_ptr<TelemetryHub> telemetry)
         : port_(port),
           staHwnd_(staHwnd),
           obsMgr_(obsMgr),
-          telemetry_(telemetry) {}
+          telemetry_(std::move(telemetry)) {}
 
     ~ObservatoryHttpServer() {
         Stop();
@@ -84,6 +84,10 @@ public:
         if (acceptThread_.joinable()) {
             acceptThread_.join();
         }
+        // Gracefully drain in-flight client handlers before destroying the server instance
+        for (int i = 0; i < 60 && activeHandlers_.load() > 0; ++i) {
+            Sleep(10);
+        }
     }
 
     uint16_t Port() const { return port_; }
@@ -92,9 +96,10 @@ private:
     uint16_t port_;
     HWND staHwnd_;
     ObserverContextManager* obsMgr_;
-    TelemetryHub* telemetry_;
+    std::shared_ptr<TelemetryHub> telemetry_;
     SOCKET listenSock_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
+    std::atomic<int> activeHandlers_{0};
     std::thread acceptThread_;
 
     static void SendAll(SOCKET s, const char* data, size_t len) {
@@ -131,11 +136,17 @@ private:
                 if (!running_) break;
                 continue;
             }
+            activeHandlers_.fetch_add(1);
             std::thread(&ObservatoryHttpServer::HandleClient, this, client).detach();
         }
     }
 
     void HandleClient(SOCKET client) {
+        struct HandlerGuard {
+            std::atomic<int>& counter;
+            ~HandlerGuard() { counter.fetch_sub(1); }
+        } guard{activeHandlers_};
+
         DWORD recvTimeout = 5000;
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
@@ -272,12 +283,23 @@ private:
             } else if (const ValNode* txt = FindJsonField(reqJson, "text"); txt && txt->kind == ValNode::String) {
                 req.utf8Text = txt->strVal;
             }
-            SendMessageW(staHwnd_, WM_SCLIP_ARM_SYNC, reinterpret_cast<WPARAM>(&req), 0);
+            DWORD_PTR smRes = 0;
+            if (!SendMessageTimeoutW(staHwnd_, WM_SCLIP_ARM_SYNC, reinterpret_cast<WPARAM>(&req), 0,
+                                     SMTO_ABORTIFHUNG, 3000, &smRes)) {
+                req.ok = false;
+            }
             std::ostringstream resp;
             resp << "{\"ok\":" << (req.ok ? "true" : "false")
                  << ",\"envelopeId\":" << req.outEnvelopeId
                  << ",\"clipboardSeq\":" << req.outClipboardSeq << "}";
             SendHttpResponse(client, 200, "OK", "application/json", resp.str());
+            return;
+        }
+
+        if (method == "POST" && path == "/api/disarm") {
+            DWORD_PTR smRes = 0;
+            SendMessageTimeoutW(staHwnd_, WM_SCLIP_DISARM_SYNC, 0, 0, SMTO_ABORTIFHUNG, 2000, &smRes);
+            SendHttpResponse(client, 200, "OK", "application/json", "{\"ok\":true}");
             return;
         }
 
@@ -322,7 +344,12 @@ private:
                 if (const ValNode* v = FindJsonField(reqJson, "windowTitle"); v && v->kind == ValNode::String) preq.windowTitle = v->strVal;
                 if (const ValNode* v = FindJsonField(reqJson, "format"); v && v->kind == ValNode::String) preq.requestedKind = v->strVal;
             }
-            SendMessageW(staHwnd_, WM_SCLIP_PREVIEW_SYNC, reinterpret_cast<WPARAM>(&preq), 0);
+            DWORD_PTR smRes = 0;
+            if (!SendMessageTimeoutW(staHwnd_, WM_SCLIP_PREVIEW_SYNC, reinterpret_cast<WPARAM>(&preq), 0,
+                                     SMTO_ABORTIFHUNG, 4000, &smRes)) {
+                preq.ok = false;
+                preq.errorMsg = "STA daemon timed out while synthesizing preview";
+            }
             std::ostringstream resp;
             resp << "{\"ok\":" << (preq.ok ? "true" : "false")
                  << ",\"kind\":\"" << JsonEscape(preq.resultKind) << "\""

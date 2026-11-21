@@ -57,7 +57,7 @@ public:
             SetTimer(hwnd_, 1, 250, nullptr);
         }
 
-        httpServer_ = std::make_unique<sclip::ObservatoryHttpServer>(port_, hwnd_, &observerMgr_, &telemetry_);
+        httpServer_ = std::make_unique<sclip::ObservatoryHttpServer>(port_, hwnd_, &observerMgr_, telemetry_);
         if (!httpServer_->Start()) {
             std::fprintf(stderr, "[FATAL] Failed to bind local Observatory HTTP port %u.\n", port_);
             CleanupBeforeQuit();
@@ -101,7 +101,7 @@ private:
     uint64_t envelopeCounter_ = 0;
 
     sclip::ObserverContextManager observerMgr_;
-    sclip::TelemetryHub telemetry_;
+    std::shared_ptr<sclip::TelemetryHub> telemetry_ = std::make_shared<sclip::TelemetryHub>();
     sclip::SuperpositionDataObject* currentDataObj_ = nullptr;
     sclip::DesktopMicroHud hud_;
     sclip::SystemTrayController tray_;
@@ -164,7 +164,7 @@ private:
 
     bool MountSuperpositionSeed(sclip::QuantumSeed&& seed) {
         isSelfArming_ = true;
-        auto* nextObj = new sclip::SuperpositionDataObject(seed, &observerMgr_, &telemetry_);
+        auto* nextObj = new sclip::SuperpositionDataObject(seed, &observerMgr_, telemetry_);
 
         HRESULT hr = SetOleClipboardWithRetry(nextObj);
         if (FAILED(hr)) {
@@ -178,7 +178,7 @@ private:
         }
         currentDataObj_ = nextObj;
         lastOwnSeq_ = GetClipboardSequenceNumber();
-        telemetry_.SetActiveSeed(seed);
+        telemetry_->SetActiveSeed(seed);
         isSelfArming_ = false;
         RefreshHudOverlay();
         return true;
@@ -194,7 +194,7 @@ private:
             currentDataObj_ = nullptr;
         }
         lastOwnSeq_ = GetClipboardSequenceNumber();
-        telemetry_.ClearSeed();
+        telemetry_->ClearSeed();
         isSelfArming_ = false;
         RefreshHudOverlay();
     }
@@ -295,7 +295,7 @@ private:
                     currentDataObj_->Release();
                     currentDataObj_ = nullptr;
                 }
-                telemetry_.SetActiveSeed(seed);
+                telemetry_->SetActiveSeed(seed);
                 RefreshHudOverlay();
             }
         } else {
@@ -304,7 +304,7 @@ private:
                 currentDataObj_->Release();
                 currentDataObj_ = nullptr;
             }
-            telemetry_.ClearSeed();
+            telemetry_->ClearSeed();
             RefreshHudOverlay();
         }
     }
@@ -455,7 +455,7 @@ private:
     void RefreshHudOverlay() {
         if (headless_ || !hud_.IsVisible()) return;
         bool hasSeed = false;
-        sclip::QuantumSeed seed = telemetry_.GetActiveSeed(&hasSeed);
+        sclip::QuantumSeed seed = telemetry_->GetActiveSeed(&hasSeed);
         sclip::ObserverSnapshot obs = observerMgr_.Capture(false);
         bool isBypass = (obs.lockMode == sclip::ManualLockMode::RawBypass);
 
